@@ -20,6 +20,18 @@ class MemoryStorageArea {
 class TestPlaybackQueue extends PlaybackQueue {
   constructor(options = {}) {
     const listeners = [];
+    const sentMessages = [];
+    const runtimeStatus = options.runtimeStatus || {
+      playing: false,
+      paused: false,
+      chunkId: null,
+      ended: false,
+      error: null,
+      streamStatus: "idle",
+      bytesReceived: 0,
+      bufferedSegmentCount: 0,
+      slots: []
+    };
     const runtimeApi = options.runtimeApi || {
       onMessage: {
         addListener(listener) {
@@ -27,17 +39,12 @@ class TestPlaybackQueue extends PlaybackQueue {
         }
       },
       async sendMessage(message) {
+        sentMessages.push(message);
+        if (options.onSendMessage) {
+          options.onSendMessage(message);
+        }
         if (message.type === "GET_PLAYBACK_STATUS") {
-          return {
-            playing: false,
-            paused: false,
-            chunkId: null,
-            ended: false,
-            error: null,
-            streamStatus: "idle",
-            bytesReceived: 0,
-            bufferedSegmentCount: 0
-          };
+          return runtimeStatus;
         }
         return { ok: true };
       }
@@ -52,6 +59,7 @@ class TestPlaybackQueue extends PlaybackQueue {
     };
     this.listeners = listeners;
     this.startedStreams = [];
+    this.sentMessages = sentMessages;
     this.processCalls = 0;
   }
 
@@ -65,6 +73,21 @@ class TestPlaybackQueue extends PlaybackQueue {
 
   async ensureChapterData(session) {
     session.totalChunks = session.totalChunks || 3;
+  }
+
+  async getChunkRecord(chapterId, chunkIndex) {
+    if (chunkIndex < 0 || chunkIndex >= 3) {
+      return null;
+    }
+
+    return {
+      storyId: "story-test",
+      chapterId,
+      chunkIndex,
+      text: `Chunk ${chunkIndex}`,
+      textHash: `hash-${chunkIndex}`,
+      chunkId: `${chapterId}:${chunkIndex}:h${chunkIndex + 1}`
+    };
   }
 
   async startCurrentChunkStream(chapterId) {
@@ -165,6 +188,190 @@ test("play on a warmed session starts the live stream path", async () => {
   assert.equal(state.chapterId, "chapter-play");
   assert.equal(state.playRequested, true);
   assert.deepEqual(queue.startedStreams, ["chapter-play"]);
+});
+
+test("chunk start prefetches the next chunk", async () => {
+  const queue = new TestPlaybackQueue();
+
+  await queue.saveSession({
+    chapterId: "chapter-prefetch",
+    storyId: "story-prefetch",
+    title: "Prefetch Chapter",
+    partId: "chapter-prefetch",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    state: "awaiting_chunk_end",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "playing",
+    currentChunkIndex: 0,
+    currentChunkId: "chunk-prefetch-0",
+    totalChunks: 3,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: true,
+    playbackAttemptId: "chapter-prefetch:attempt:1",
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "playback_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: null,
+    text: "Prefetch text",
+    transportMode: "live_stream",
+    streamStatus: "playing",
+    bytesReceived: 800,
+    bufferedAudioMs: 200,
+    firstByteAt: 1,
+    firstAudioAt: 2,
+    stallCount: 0
+  });
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-prefetch",
+    chunkId: "chunk-prefetch-0",
+    attemptId: "chapter-prefetch:attempt:1"
+  });
+
+  const prepareMessage = queue.sentMessages.find((message) => message.type === "PREPARE_STREAM_PLAYBACK");
+  assert.equal(prepareMessage.chunkId, "chapter-prefetch:1:h2");
+});
+
+test("prepared next chunk is promoted on handoff", async () => {
+  const queue = new TestPlaybackQueue({
+    runtimeStatus: {
+      playing: false,
+      paused: false,
+      chunkId: null,
+      ended: false,
+      error: null,
+      streamStatus: "idle",
+      bytesReceived: 0,
+      bufferedSegmentCount: 0,
+      slots: [
+        {
+          chunkId: "chapter-handoff:1:h2",
+          attemptId: "chapter-handoff:prefetch:1",
+          chapterId: "chapter-handoff",
+          role: "prepared",
+          streamStatus: "prepared",
+          bytesReceived: 1200,
+          bufferedAudioMs: 900,
+          firstByteAt: 1,
+          firstAudioAt: 2,
+          playbackStarted: false,
+          paused: false,
+          ready: true
+        }
+      ]
+    }
+  });
+
+  queue.sentMessages.length = 0;
+
+  await queue.saveSession({
+    chapterId: "chapter-handoff",
+    storyId: "story-handoff",
+    title: "Handoff Chapter",
+    partId: "chapter-handoff",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    state: "advancing",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "idle",
+    currentChunkIndex: 1,
+    currentChunkId: null,
+    totalChunks: 3,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: true,
+    playbackAttemptId: null,
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "chunk_playback_ended",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: "chapter-handoff:0:h1",
+    text: "Handoff text",
+    transportMode: "live_stream",
+    streamStatus: "idle",
+    bytesReceived: 0,
+    bufferedAudioMs: 0,
+    firstByteAt: null,
+    firstAudioAt: null,
+    stallCount: 0
+  });
+
+  await PlaybackQueue.prototype.startCurrentChunkStream.call(queue, "chapter-handoff");
+
+  assert.equal(
+    queue.sentMessages.find((message) => message.type === "START_PREPARED_STREAM")?.chunkId,
+    "chapter-handoff:1:h2"
+  );
+  assert.equal(
+    queue.sentMessages.find((message) => message.type === "PREPARE_STREAM_PLAYBACK")?.chunkId,
+    "chapter-handoff:2:h3"
+  );
+});
+
+test("prepare ready can trigger the second lookahead chunk", async () => {
+  const queue = new TestPlaybackQueue();
+
+  await queue.saveSession({
+    chapterId: "chapter-lookahead",
+    storyId: "story-lookahead",
+    title: "Lookahead Chapter",
+    partId: "chapter-lookahead",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    state: "awaiting_chunk_end",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "playing",
+    currentChunkIndex: 0,
+    currentChunkId: "chapter-lookahead:0:h1",
+    totalChunks: 3,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: true,
+    playbackAttemptId: "chapter-lookahead:attempt:1",
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "playback_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: null,
+    text: "Lookahead text",
+    transportMode: "live_stream",
+    streamStatus: "playing",
+    bytesReceived: 900,
+    bufferedAudioMs: 300,
+    firstByteAt: 1,
+    firstAudioAt: 2,
+    stallCount: 0
+  });
+
+  await queue.handleRuntimeMessage({
+    type: "STREAM_PREPARE_READY",
+    chapterId: "chapter-lookahead",
+    chunkId: "chapter-lookahead:1:h2"
+  });
+
+  assert.equal(
+    queue.sentMessages.find((message) => message.type === "PREPARE_STREAM_PLAYBACK")?.chunkId,
+    "chapter-lookahead:2:h3"
+  );
 });
 
 test("play resumes paused transport before falling back to restart", async () => {

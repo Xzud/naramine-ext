@@ -131,8 +131,10 @@ class ByteQueue {
 }
 
 export class WavStreamPlayer {
-  constructor(callbacks = {}) {
+  constructor(callbacks = {}, options = {}) {
     this.callbacks = callbacks;
+    this.autoStart = options.autoStart ?? true;
+    this.startBufferMs = options.startBufferMs ?? DEFAULT_START_BUFFER_MS;
     this.audioContext = null;
     this.processor = null;
     this.abortController = null;
@@ -145,6 +147,7 @@ export class WavStreamPlayer {
     this.streamEnded = false;
     this.paused = false;
     this.stalled = false;
+    this.readyNotified = false;
     this.bytesReceived = 0;
     this.firstByteAt = null;
     this.firstAudioAt = null;
@@ -210,6 +213,13 @@ export class WavStreamPlayer {
     return this.playbackStarted;
   }
 
+  setAutoStart(autoStart) {
+    this.autoStart = Boolean(autoStart);
+    if (this.autoStart) {
+      this.maybeStartPlayback();
+    }
+  }
+
   async stop() {
     this.closed = true;
     this.streamStatus = "stopped";
@@ -237,7 +247,8 @@ export class WavStreamPlayer {
       firstByteAt: this.firstByteAt,
       firstAudioAt: this.firstAudioAt,
       playbackStarted: this.playbackStarted,
-      paused: this.paused
+      paused: this.paused,
+      ready: this.readyNotified || this.getBufferedAudioMs() >= this.startBufferMs
     };
   }
 
@@ -296,10 +307,12 @@ export class WavStreamPlayer {
       if (dataBytes.length > 0) {
         this.pcmQueue.append(dataBytes);
       }
+      this.maybeNotifyReady();
       return;
     }
 
     this.pcmQueue.append(chunk);
+    this.maybeNotifyReady();
   }
 
   ensureAudioContext() {
@@ -329,6 +342,7 @@ export class WavStreamPlayer {
     if (
       this.playbackStarted ||
       this.paused ||
+      !this.autoStart ||
       !this.header ||
       !this.audioContext ||
       !this.processor
@@ -337,10 +351,11 @@ export class WavStreamPlayer {
     }
 
     const minStartBytes = Math.ceil(
-      (this.header.sampleRate * this.header.bytesPerFrame * DEFAULT_START_BUFFER_MS) / 1000
+      (this.header.sampleRate * this.header.bytesPerFrame * this.startBufferMs) / 1000
     );
 
     if (this.pcmQueue.length < minStartBytes) {
+      this.maybeNotifyReady(minStartBytes);
       return;
     }
 
@@ -351,6 +366,28 @@ export class WavStreamPlayer {
     this.firstAudioAt = Date.now();
     this.callbacks.onStarted?.(this.getStatus());
     this.emitProgress(true);
+  }
+
+  maybeNotifyReady(minStartBytes = null) {
+    if (this.readyNotified || !this.header || this.playbackStarted) {
+      return;
+    }
+
+    const thresholdBytes =
+      minStartBytes ??
+      Math.ceil(
+        (this.header.sampleRate * this.header.bytesPerFrame * this.startBufferMs) / 1000
+      );
+
+    if (this.pcmQueue.length < thresholdBytes) {
+      return;
+    }
+
+    this.readyNotified = true;
+    if (!this.autoStart) {
+      this.streamStatus = "prepared";
+    }
+    this.callbacks.onReady?.(this.getStatus());
   }
 
   handleAudioProcess(event) {

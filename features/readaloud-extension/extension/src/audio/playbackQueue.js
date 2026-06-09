@@ -2,7 +2,8 @@ import {
   DEFAULT_CHAPTER_ID,
   DEFAULT_PROVIDER_MODE,
   DEFAULT_STORY_ID,
-  DEFAULT_VOICE
+  DEFAULT_VOICE,
+  STREAM_LOOKAHEAD_DEPTH
 } from "../shared/constants.js";
 import { chunkText, stableHash } from "../text/chunkText.js";
 import {
@@ -37,7 +38,9 @@ const PLAYBACK_RUNTIME_EVENTS = new Set([
   "CHUNK_PLAYBACK_ENDED",
   "CHUNK_PLAYBACK_ERROR",
   "CHUNK_PLAYBACK_INTERRUPTED",
-  "STREAM_PLAYBACK_PROGRESS"
+  "STREAM_PLAYBACK_PROGRESS",
+  "STREAM_PREPARE_READY",
+  "STREAM_PREPARE_ERROR"
 ]);
 
 export class PlaybackQueue {
@@ -130,7 +133,8 @@ export class PlaybackQueue {
         error: null,
         streamStatus: "idle",
         bytesReceived: 0,
-        bufferedSegmentCount: 0
+        bufferedSegmentCount: 0,
+        slots: []
       };
     } catch (_error) {
       return {
@@ -141,7 +145,8 @@ export class PlaybackQueue {
         error: null,
         streamStatus: "idle",
         bytesReceived: 0,
-        bufferedSegmentCount: 0
+        bufferedSegmentCount: 0,
+        slots: []
       };
     }
   }
@@ -149,6 +154,20 @@ export class PlaybackQueue {
   async dispatchStreamPlayback(payload) {
     return this.runtimeApi.sendMessage({
       type: "START_STREAM_PLAYBACK",
+      ...payload
+    });
+  }
+
+  async dispatchPrepareStreamPlayback(payload) {
+    return this.runtimeApi.sendMessage({
+      type: "PREPARE_STREAM_PLAYBACK",
+      ...payload
+    });
+  }
+
+  async dispatchStartPreparedStream(payload) {
+    return this.runtimeApi.sendMessage({
+      type: "START_PREPARED_STREAM",
       ...payload
     });
   }
@@ -167,6 +186,52 @@ export class PlaybackQueue {
     } catch (_error) {
       return { ok: false, resumed: false, chunkId: null };
     }
+  }
+
+  getPreparedSlotSnapshot(offscreenStatus, chunkId) {
+    return offscreenStatus?.slots?.find((slot) => slot.chunkId === chunkId) || null;
+  }
+
+  async prefetchChunkAtOffset(chapterId, session, offset) {
+    if (!session || typeof session.currentChunkIndex !== "number") {
+      return false;
+    }
+
+    if (offset < 1 || offset > STREAM_LOOKAHEAD_DEPTH) {
+      return false;
+    }
+
+    const chunk = await this.getChunkRecord(chapterId, session.currentChunkIndex + offset);
+    if (!chunk) {
+      return false;
+    }
+
+    const offscreenStatus = await this.queryOffscreenPlaybackStatus();
+    if (this.getPreparedSlotSnapshot(offscreenStatus, chunk.chunkId)) {
+      return false;
+    }
+
+    const provider = this.getProvider(session);
+    const response = await this.dispatchPrepareStreamPlayback({
+      chunkId: chunk.chunkId,
+      chapterId,
+      attemptId: `${session.chapterId}:lookahead:${chunk.chunkIndex}:${offset}`,
+      request: provider.createStreamRequest({
+        text: chunk.text,
+        voice: session.voice,
+        format: "wav"
+      })
+    });
+
+    return Boolean(response?.ok);
+  }
+
+  async prefetchLookahead(chapterId, session, offset = 1) {
+    if (offset > STREAM_LOOKAHEAD_DEPTH) {
+      return false;
+    }
+
+    return this.prefetchChunkAtOffset(chapterId, session, offset);
   }
 
   async getState(chapterId = null) {
@@ -522,10 +587,11 @@ export class PlaybackQueue {
     }
 
     const offscreenStatus = await this.queryOffscreenPlaybackStatus();
-    if (offscreenStatus.chunkId === chunk.chunkId && ["connecting", "buffering", "receiving", "playing", "paused"].includes(offscreenStatus.streamStatus)) {
+    const offscreenSlot = this.getPreparedSlotSnapshot(offscreenStatus, chunk.chunkId);
+    if (offscreenSlot?.role === "active" && ["connecting", "buffering", "receiving", "playing", "paused"].includes(offscreenSlot.streamStatus)) {
       return true;
     }
-    if (offscreenStatus.chunkId === chunk.chunkId && offscreenStatus.error) {
+    if (offscreenSlot?.role === "active" && offscreenSlot.error) {
       await this.stopOffscreenPlayback();
     }
 
@@ -547,16 +613,35 @@ export class PlaybackQueue {
 
     try {
       const provider = this.getProvider(scheduledSession);
-      const response = await this.dispatchStreamPlayback({
-        chunkId: chunk.chunkId,
-        chapterId,
-        attemptId,
-        request: provider.createStreamRequest({
-          text: chunk.text,
-          voice: scheduledSession.voice,
-          format: "wav"
-        })
+      const request = provider.createStreamRequest({
+        text: chunk.text,
+        voice: scheduledSession.voice,
+        format: "wav"
       });
+      let response = null;
+      if (offscreenSlot?.role === "prepared") {
+        response = await this.dispatchStartPreparedStream({
+          chunkId: chunk.chunkId,
+          chapterId,
+          attemptId,
+          request
+        });
+        if (!response?.ok) {
+          response = await this.dispatchStreamPlayback({
+            chunkId: chunk.chunkId,
+            chapterId,
+            attemptId,
+            request
+          });
+        }
+      } else {
+        response = await this.dispatchStreamPlayback({
+          chunkId: chunk.chunkId,
+          chapterId,
+          attemptId,
+          request
+        });
+      }
       if (!response?.ok) {
         throw new Error(response?.error || `Failed to dispatch playback for ${chunk.chunkId}`);
       }
@@ -564,6 +649,7 @@ export class PlaybackQueue {
         ...scheduledSession,
         lastEvent: "stream_dispatch_accepted"
       });
+      await this.prefetchChunkAtOffset(chapterId, scheduledSession, 1);
       return true;
     } catch (error) {
       const currentSession = (await this.loadSession(chapterId)) || scheduledSession;
@@ -608,6 +694,16 @@ export class PlaybackQueue {
       return;
     }
 
+    if (message.type === "STREAM_PREPARE_READY") {
+      if (typeof session.currentChunkIndex === "number") {
+        const nextChunk = await this.getChunkRecord(chapterId, session.currentChunkIndex + 1);
+        if (nextChunk?.chunkId === message.chunkId && STREAM_LOOKAHEAD_DEPTH > 1) {
+          await this.prefetchChunkAtOffset(chapterId, session, 2);
+        }
+      }
+      return;
+    }
+
     if (message.type === "CHUNK_PLAYBACK_STARTED") {
       const startedSession = {
         ...markPlaybackStarted(session, message.chunkId, message.attemptId || null),
@@ -618,6 +714,7 @@ export class PlaybackQueue {
         firstAudioAt: message.firstAudioAt || session.firstAudioAt || Date.now()
       };
       await this.saveSession(startedSession);
+      await this.prefetchChunkAtOffset(chapterId, startedSession, 1);
       return;
     }
 
