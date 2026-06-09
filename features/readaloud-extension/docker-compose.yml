@@ -1,12 +1,18 @@
 services:
+  kokoro:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    ports:
+      - "8880:8880"
+
   backend:
     build:
       context: ./backend
+    depends_on:
+      - kokoro
     environment:
       APP_HOST: 0.0.0.0
       APP_PORT: 3000
       TTS_MODE: local
-      LOCAL_KOKORO_URL: http://host.docker.internal:8880
+      LOCAL_KOKORO_URL: http://kokoro:8880
     ports:
       - "3000:3000"
-

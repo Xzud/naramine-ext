@@ -25,9 +25,10 @@ This feature folder implements the prompt in [prompts/streaming-mvp-prompt.md](/
 
 ## Manual run
 
-1. Start Kokoro locally:
-   `docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest`
-2. Start the proxy backend from this folder:
+1. Start Kokoro and the proxy backend together from this folder:
    `docker compose up --build`
+2. Verify the services if needed:
+   `curl http://localhost:8880/health`
+   `curl http://localhost:3000/health`
 3. Load `features/readaloud-extension/extension/` as an unpacked Chrome extension.
 4. Open the popup and press `Play`.

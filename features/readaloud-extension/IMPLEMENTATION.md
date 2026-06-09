@@ -6,7 +6,7 @@ Implementation choices follow the current streaming refactor directly:
 
 - Separate feature folder to minimize merge conflicts.
 - Browser extension with popup, content script, MV3 service worker, offscreen document, IndexedDB, chunker, and provider abstraction.
-- Local Docker Kokoro first, Modal-compatible backend/provider second.
+- Local Docker Compose stack runs Kokoro plus the proxy backend together, with Modal-compatible provider support still available.
 - WAV end-to-end for MVP, but now as a live byte stream over the backend proxy.
 - Offscreen owns the active network transport and progressive playback.
 - IndexedDB is no longer on the first-playback critical path.
@@ -15,6 +15,7 @@ Implementation choices follow the current streaming refactor directly:
 
 - Confirm the feature is fully isolated under `features/readaloud-extension/` and does not modify unrelated code.
 - Confirm the extension manifest is MV3, includes `storage`, `offscreen`, and `activeTab`, and grants localhost host permissions for Kokoro and backend proxy calls.
+- Confirm `docker-compose.yml` starts both the `kokoro` service and the `backend` proxy service with the backend pointed at `http://kokoro:8880`.
 - Confirm popup, service worker, offscreen document, IndexedDB layer, chunker, and TTS providers exist in the prompt-specified structure.
 - Confirm the runtime flow is hardcoded text -> chunks -> backend `/tts/stream` -> offscreen playback, with playback starting before the full audio response completes.
 - Confirm the service worker orchestrates playback but does not fetch and materialize the active chunk audio itself.
