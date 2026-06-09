@@ -1,0 +1,16 @@
+{
+  "name": "readaloud-extension-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test extension/tests/*.test.js",
+    "check:backend": "python3 -m py_compile backend/app.py backend/tts_local.py backend/tts_modal.py"
+  },
+  "dependencies": {
+    "fastapi": "^0.115.0",
+    "httpx": "^0.28.0",
+    "pydantic": "^2.9.0",
+    "uvicorn": "^0.32.0"
+  }
+}

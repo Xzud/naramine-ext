@@ -1,0 +1,12 @@
+export const DB_NAME = "readaloud_mvp";
+export const DB_VERSION = 1;
+export const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+export const MAX_CHARS = 600;
+export const MAX_CHUNK_CHARS = 1000;
+export const MIN_READY_CHUNKS = 2;
+export const TARGET_READY_CHUNKS = 5;
+export const MAX_READY_CHUNKS = 8;
+export const DEFAULT_STORY_ID = "hardcoded-story";
+export const DEFAULT_CHAPTER_ID = "hardcoded-chapter-1";
+export const DEFAULT_VOICE = "af_heart";
+export const DEFAULT_PROVIDER_MODE = "local";

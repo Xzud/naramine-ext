@@ -1,0 +1,12 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: 3000
+      TTS_MODE: local
+      LOCAL_KOKORO_URL: http://host.docker.internal:8880
+    ports:
+      - "3000:3000"
+

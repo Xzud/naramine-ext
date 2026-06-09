@@ -1,0 +1,127 @@
+Readaloud Extension Logging Notes
+=================================
+
+Purpose
+- Capture the implemented runtime signals and where to inspect them when playback breaks.
+- Keep a lightweight feedback trail inside the feature folder without changing product behavior.
+
+Implemented log points
+- Service worker / queue console logs:
+  - `session_warmup_started`
+  - `session_warmup_resumed`
+  - `startup_buffer_progress`
+  - `startup_buffer_ready`
+  - `session_created`
+  - `play_requested`
+  - `play_requested_after_stop`
+  - `session_resumed`
+  - `session_resume_fallback_requested`
+  - `chapter_data_replaced`
+  - `chapter_data_seeded`
+  - `chunk_synthesis_started`
+  - `chunk_synthesized`
+  - `chunk_synthesis_failed`
+  - `playback_dispatch_requested`
+  - `playback_started`
+  - `playback_start_interrupted_retry_scheduled`
+  - `chunk_playback_ended`
+  - `playback_retry_scheduled`
+  - `playback_failed`
+  - `playback_end_ignored`
+  - `session_ended`
+  - `extraction_failed`
+- Offscreen console logs:
+  - `audio_play_requested`
+  - `audio_play_resolved`
+  - `audio_play_rejected`
+  - `audio_pause_requested`
+  - `audio_cleared`
+
+How to inspect when it breaks
+- Open the extension service worker console in Chrome.
+- Check popup diagnostics first:
+  - `Session state`
+  - `Playback`
+  - `Warmup`
+  - `Transport`
+  - `Current chunk`
+  - `Chunk ID`
+  - `Startup buffer`
+  - `Ready audio cache`
+  - `Last event`
+  - `Last error`
+- Correlate popup values with queue logs by `chapter=` and `chunk=`.
+- When available, also correlate by `attempt=`.
+
+Recent investigated issue
+- Buffered-audio meaning:
+  - `Ready audio cache` means synthesized audio blobs already stored for the active chapter.
+  - It does not mean playback has already started or that the queue is healthy.
+- Warmup meaning:
+  - `Warmup` describes whether the chapter is still buffering in the background, already warm, or actively preparing for playback start.
+- Transport meaning:
+  - `Transport` describes the actual playback transport lane such as `idle`, `queued`, `starting`, `playing`, `paused`, or `ended`.
+- Startup buffer meaning:
+  - `Startup buffer` means how many ready chunks exist toward the first-playback threshold.
+  - Playback now waits for `3` ready chunks before the first chunk starts, unless the chapter is shorter than that.
+
+Expected healthy flow
+- Open a valid Wattpad reading page:
+  - popup may show `Warmup: warming`
+  - popup should keep `Transport: idle`
+  - queue logs should include `session_warmup_started` or `session_warmup_resumed`
+- When the startup threshold is satisfied before user playback:
+  - popup should show `Warmup: warm_ready`
+  - popup should still keep `Transport: idle`
+- Press `Play`:
+  - popup should move through `Warmup: starting` and `Transport: queued` / `starting`
+  - queue logs should include `play_requested` or `play_requested_after_stop`
+  - then `playback_dispatch_requested`
+  - then `playback_started`
+- Press `Pause` then `Play` again:
+  - best case queue log is `session_resumed`
+  - fallback path log is `session_resume_fallback_requested`
+
+Chapter-change expectations
+- On Wattpad SPA navigation to a new part:
+  - the active `Part ID` should change
+  - a new warmup cycle should begin for the new chapter
+  - old sessions may remain in storage, but `activeChapterId` should point to the new part
+
+Recent investigated issue
+- Symptom:
+  - Popup showed buffered audio was available.
+  - Popup later showed `AbortError` during playback startup.
+- Root cause:
+  - The offscreen audio startup lifecycle could be interrupted by internal cleanup or superseded attempts.
+  - The queue also needed to distinguish interrupted startup from a final playback failure.
+- Fix:
+  - Startup playback now uses attempt ids.
+  - The queue waits for a minimum startup buffer before first playback.
+  - `AbortError` during interrupted startup is treated as a bounded retry condition.
+  - Stale attempt state is ignored instead of poisoning the current playback attempt.
+
+Audio error diagnostics
+- Offscreen playback reports:
+  - media error code name when available
+  - `readyState`
+  - `networkState`
+  - attempt id correlation in console logs
+- Example:
+  - `Audio element failed to play (MEDIA_ERR_DECODE, readyState=0, networkState=3)`
+- Interrupted startup clue:
+  - `AbortError` plus `audio_cleared` / `audio_play_rejected` around the same attempt usually indicates startup interruption rather than a true media decode failure.
+
+Feedback template
+- Date:
+- Page URL:
+- Warmup:
+- Transport:
+- Popup state:
+- Playback:
+- Current chunk:
+- Chunk ID:
+- Last event:
+- Last error:
+- Service worker log lines:
+- Repro steps:

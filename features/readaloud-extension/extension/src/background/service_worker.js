@@ -1,0 +1,73 @@
+import { PlaybackQueue } from "../audio/playbackQueue.js";
+import { createRuntimeState } from "../audio/runtimeState.js";
+
+const queue = new PlaybackQueue();
+
+function getChapterIdFromMessage(message) {
+  return message?.payload?.chapterId || message?.chapterId || null;
+}
+
+async function handleScopedRequest(message) {
+  switch (message.type) {
+    case "PAGE_READY":
+      return queue.warmup(message.payload || {});
+    case "PLAY":
+      return queue.start(message.payload || {});
+    case "PAUSE":
+      return queue.pause(message.payload?.chapterId || null);
+    case "STOP":
+      return queue.stop(message.payload?.chapterId || null);
+    case "GET_STATE":
+      return queue.getState(message.payload?.chapterId || null);
+    default:
+      return queue.buildRequestFailureState(
+        getChapterIdFromMessage(message),
+        `Unknown message type: ${message.type || "unknown"}`,
+        "unknown_request_type"
+      );
+  }
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  console.log("Readaloud MVP installed");
+});
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message?.scope !== "readaloud") {
+    return undefined;
+  }
+
+  (async () => {
+    sendResponse(await handleScopedRequest(message));
+  })().catch((error) => {
+    console.error("Service worker request failed", error);
+    queue
+      .buildRequestFailureState(getChapterIdFromMessage(message), error, "service_worker_request_failed")
+      .then((state) => sendResponse(state))
+      .catch((nestedError) => {
+        console.error("Structured failure response failed", nestedError);
+        sendResponse(
+          createRuntimeState({
+          chapterId: getChapterIdFromMessage(message),
+          storyId: null,
+          partId: null,
+          title: null,
+          state: "error",
+          playbackStatus: "error",
+          currentChunkIndex: null,
+          currentChunkId: null,
+          totalChunks: 0,
+          readyAudioCount: 0,
+          failedCount: 0,
+          extractionStrategy: null,
+          extractionConfidence: null,
+          lastEvent: "service_worker_request_failed",
+          errorMessage: String(error),
+          stateAvailable: true
+          })
+        );
+      });
+  });
+
+  return true;
+});
