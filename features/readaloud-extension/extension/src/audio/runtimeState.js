@@ -37,6 +37,10 @@ export function deriveTransportStatus(sessionLike) {
     return "unavailable";
   }
 
+  if (["connecting", "receiving", "buffering", "playing", "paused"].includes(sessionLike.streamStatus)) {
+    return sessionLike.streamStatus === "receiving" ? "starting" : sessionLike.streamStatus;
+  }
+
   if (sessionLike.playbackStatus === "error" || sessionLike.state === "error") {
     return "error";
   }
@@ -97,6 +101,13 @@ export function createRuntimeState(overrides = {}) {
     lastRetryKind: null,
     playbackAttemptId: null,
     playRequested: false,
+    transportMode: "live_stream",
+    streamStatus: "idle",
+    bytesReceived: 0,
+    bufferedAudioMs: 0,
+    firstByteAt: null,
+    firstAudioAt: null,
+    stallCount: 0,
     warmupStatus: "idle",
     transportStatus: "idle",
     ...overrides
@@ -182,6 +193,13 @@ export function mapSessionToRuntimeState(session, cache = {}, overrides = {}) {
     lastRetryKind: session.lastRetryKind || null,
     playbackAttemptId: session.playbackAttemptId || null,
     playRequested,
+    transportMode: session.transportMode || "live_stream",
+    streamStatus: session.streamStatus || "idle",
+    bytesReceived: session.bytesReceived || 0,
+    bufferedAudioMs: session.bufferedAudioMs || 0,
+    firstByteAt: session.firstByteAt || null,
+    firstAudioAt: session.firstAudioAt || null,
+    stallCount: session.stallCount || 0,
     warmupStatus: deriveWarmupStatus({
       stateAvailable: true,
       state,
@@ -191,7 +209,8 @@ export function mapSessionToRuntimeState(session, cache = {}, overrides = {}) {
       stateAvailable: true,
       state,
       playbackStatus,
-      playRequested
+      playRequested,
+      streamStatus: session.streamStatus || "idle"
     }),
     ...overrides
   });

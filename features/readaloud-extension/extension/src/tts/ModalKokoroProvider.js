@@ -1,24 +1,43 @@
 import { TTSProvider } from "./TTSProvider.js";
 
 export class ModalKokoroProvider extends TTSProvider {
-  constructor(endpointUrl, token = "") {
+  constructor(baseUrl, token = "") {
     super();
-    this.endpointUrl = endpointUrl;
+    this.baseUrl = baseUrl.replace(/\/$/, "");
     this.token = token;
   }
 
-  async synthesize(input) {
-    const response = await fetch(this.endpointUrl, {
+  buildHeaders() {
+    return {
+      "Content-Type": "application/json",
+      ...(this.token ? { Authorization: `Bearer ${this.token}` } : {})
+    };
+  }
+
+  buildPayload(input) {
+    return {
+      text: input.text,
+      voice: input.voice,
+      format: input.format,
+      chunk_id: input.chunkId,
+      chapter_id: input.chapterId
+    };
+  }
+
+  createStreamRequest(input) {
+    return {
+      url: `${this.baseUrl}/tts/stream`,
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(this.token ? { Authorization: `Bearer ${this.token}` } : {})
-      },
-      body: JSON.stringify({
-        text: input.text,
-        voice: input.voice,
-        format: input.format
-      })
+      headers: this.buildHeaders(),
+      body: JSON.stringify(this.buildPayload(input))
+    };
+  }
+
+  async synthesize(input) {
+    const response = await fetch(`${this.baseUrl}/tts`, {
+      method: "POST",
+      headers: this.buildHeaders(),
+      body: JSON.stringify(this.buildPayload(input))
     });
 
     if (!response.ok) {

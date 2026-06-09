@@ -56,12 +56,23 @@ function getChapterRatio(state) {
 }
 
 function getStartupRatio(state) {
-  if (!state.stateAvailable || !state.startupTargetReadyAudioCount) {
+  if (!state.stateAvailable) {
     return 0;
   }
 
-  return Math.min(state.startupReadyAudioCount || 0, state.startupTargetReadyAudioCount) /
-    state.startupTargetReadyAudioCount;
+  if (state.firstAudioAt) {
+    return 1;
+  }
+
+  if (state.streamStatus === "connecting") {
+    return 0.2;
+  }
+
+  if (state.streamStatus === "receiving" || state.streamStatus === "buffering") {
+    return Math.min((state.bufferedAudioMs || 0) / 250, 0.9);
+  }
+
+  return 0;
 }
 
 function isPauseable(state) {

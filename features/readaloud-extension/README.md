@@ -12,21 +12,22 @@ This feature folder implements the prompt in [prompts/streaming-mvp-prompt.md](/
 
 1. Popup starts playback from hardcoded text.
 2. Text is chunked with stable IDs and saved in IndexedDB.
-3. Chunk 0 is synthesized to WAV via local Kokoro by default.
-4. Playback happens inside an offscreen document.
-5. Future chunks are generated and buffered in the background.
-6. Audio chunks expire after 24 hours.
+3. The service worker orchestrates chapter and chunk state but does not synthesize the active audio chunk itself.
+4. Playback happens inside an offscreen document that fetches `POST /tts/stream` and consumes WAV bytes progressively.
+5. The active playback path no longer waits on full audio blobs or IndexedDB before starting.
+6. IndexedDB remains chapter metadata storage and optional legacy cache storage, not the startup critical path.
 
 ## Validation
 
 - `npm test`
 - `python3 -m py_compile backend/app.py backend/tts_local.py backend/tts_modal.py`
+- `python3 -m unittest backend/test_streaming.py`
 
 ## Manual run
 
 1. Start Kokoro locally:
    `docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest`
-2. Optionally start the proxy backend from this folder:
+2. Start the proxy backend from this folder:
    `docker compose up --build`
 3. Load `features/readaloud-extension/extension/` as an unpacked Chrome extension.
 4. Open the popup and press `Play`.

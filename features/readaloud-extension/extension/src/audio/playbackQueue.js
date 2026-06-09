@@ -2,24 +2,17 @@ import {
   DEFAULT_CHAPTER_ID,
   DEFAULT_PROVIDER_MODE,
   DEFAULT_STORY_ID,
-  DEFAULT_VOICE,
-  MAX_READY_CHUNKS,
-  STARTUP_READY_CHUNKS,
-  TARGET_READY_CHUNKS
+  DEFAULT_VOICE
 } from "../shared/constants.js";
 import { chunkText, stableHash } from "../text/chunkText.js";
 import {
   cleanupExpiredAudio,
-  countReadyAudioAhead,
-  getAudioChunkByIndex,
   getCacheStatus,
   getChapter,
+  getChunkByIndex,
   getChunksByChapter,
-  getNextPendingChunk,
   replaceChapterData,
-  saveAudioChunk,
-  saveChapter,
-  updateChunkStatus
+  saveChapter
 } from "../db/idb.js";
 import { LocalKokoroProvider } from "../tts/LocalKokoroProvider.js";
 import { ModalKokoroProvider } from "../tts/ModalKokoroProvider.js";
@@ -27,8 +20,8 @@ import {
   applyPlaybackEnded,
   applyPlaybackError,
   applyPlaybackInterrupted,
-  createRuntimeState,
   createIdleRuntimeState,
+  createRuntimeState,
   deriveTransportStatus,
   deriveWarmupStatus,
   mapSessionToRuntimeState,
@@ -43,7 +36,8 @@ const PLAYBACK_RUNTIME_EVENTS = new Set([
   "CHUNK_PLAYBACK_STARTED",
   "CHUNK_PLAYBACK_ENDED",
   "CHUNK_PLAYBACK_ERROR",
-  "CHUNK_PLAYBACK_INTERRUPTED"
+  "CHUNK_PLAYBACK_INTERRUPTED",
+  "STREAM_PLAYBACK_PROGRESS"
 ]);
 
 export class PlaybackQueue {
@@ -89,7 +83,8 @@ export class PlaybackQueue {
         stateAvailable: true,
         state: session.state || "idle",
         playbackStatus: session.playbackStatus || "idle",
-        playRequested: Boolean(session.playRequested)
+        playRequested: Boolean(session.playRequested),
+        streamStatus: session.streamStatus || "idle"
       })
     };
     await this.storageArea.set({
@@ -116,24 +111,8 @@ export class PlaybackQueue {
     return getCacheStatus(chapterId);
   }
 
-  async getAudioChunkRecord(chapterId, chunkIndex) {
-    return getAudioChunkByIndex(chapterId, chunkIndex);
-  }
-
-  async getReadyAudioCount(chapterId, currentChunkIndex) {
-    return countReadyAudioAhead(chapterId, currentChunkIndex);
-  }
-
-  async getNextPendingChunkRecord(chapterId, currentChunkIndex) {
-    return getNextPendingChunk(chapterId, currentChunkIndex);
-  }
-
-  async saveChunkAudio(record) {
-    return saveAudioChunk(record);
-  }
-
-  async setChunkStatus(chunkId, status) {
-    return updateChunkStatus(chunkId, status);
+  async getChunkRecord(chapterId, chunkIndex) {
+    return getChunkByIndex(chapterId, chunkIndex);
   }
 
   async cleanupExpiredAudioRecords() {
@@ -143,71 +122,42 @@ export class PlaybackQueue {
   async queryOffscreenPlaybackStatus() {
     try {
       const status = await this.runtimeApi.sendMessage({ type: "GET_PLAYBACK_STATUS" });
-      return status || { playing: false, paused: false, chunkId: null, ended: false, error: null };
+      return status || {
+        playing: false,
+        paused: false,
+        chunkId: null,
+        ended: false,
+        error: null,
+        streamStatus: "idle",
+        bytesReceived: 0,
+        bufferedSegmentCount: 0
+      };
     } catch (_error) {
-      return { playing: false, paused: false, chunkId: null, ended: false, error: null };
+      return {
+        playing: false,
+        paused: false,
+        chunkId: null,
+        ended: false,
+        error: null,
+        streamStatus: "idle",
+        bytesReceived: 0,
+        bufferedSegmentCount: 0
+      };
     }
   }
 
-  async dispatchChunkPlayback(chunkId, chapterId, attemptId) {
+  async dispatchStreamPlayback(payload) {
     return this.runtimeApi.sendMessage({
-      type: "PLAY_CHUNK_FROM_IDB",
-      chunkId,
-      chapterId,
-      attemptId
+      type: "START_STREAM_PLAYBACK",
+      ...payload
     });
-  }
-
-  getStartupTarget(totalChunks) {
-    if (!totalChunks || totalChunks <= 0) {
-      return 0;
-    }
-
-    return Math.min(STARTUP_READY_CHUNKS, totalChunks);
-  }
-
-  isStartupPending(session) {
-    return Boolean(session && !session.hasStartedPlayback);
-  }
-
-  getNextPlaybackAttemptId(session) {
-    return `${session.chapterId}:attempt:${(session.nextPlaybackAttemptSequence || 0) + 1}`;
-  }
-
-  async updateStartupBufferState(session, readyCount) {
-    const startupTarget = this.getStartupTarget(session.totalChunks);
-    const nextSession = {
-      ...session,
-      startupTargetReadyAudioCount: startupTarget,
-      startupReadyAudioCount: Math.min(readyCount, startupTarget),
-      startupBufferingComplete: startupTarget > 0 && readyCount >= startupTarget
-    };
-
-    if (!this.isStartupPending(session)) {
-      return nextSession;
-    }
-
-    if (!["dispatching", "starting", "playing", "awaiting_chunk_end"].includes(session.playbackStatus)) {
-      nextSession.state = nextSession.startupBufferingComplete ? "startup_ready" : "startup_buffering";
-      nextSession.playbackStatus = "idle";
-      nextSession.lastEvent = nextSession.startupBufferingComplete
-        ? "startup_buffer_ready"
-        : "startup_buffer_progress";
-    }
-
-    await this.saveSession(nextSession);
-    this.log(nextSession.lastEvent, nextSession, {
-      startupReadyAudioCount: nextSession.startupReadyAudioCount,
-      startupTargetReadyAudioCount: nextSession.startupTargetReadyAudioCount
-    });
-    return nextSession;
   }
 
   async stopOffscreenPlayback() {
     try {
       await this.runtimeApi.sendMessage({ type: "STOP_PLAYBACK" });
     } catch (_error) {
-      // Best-effort cleanup before a retry.
+      // Best-effort cleanup.
     }
   }
 
@@ -235,25 +185,14 @@ export class PlaybackQueue {
 
   async buildRequestFailureState(chapterId = null, error, lastEvent = "request_failed") {
     const resolvedChapterId = await this.resolveChapterId(chapterId);
-    let cache = {
+    const cache = await this.getCacheSnapshot(resolvedChapterId).catch(() => ({
       chunkCount: 0,
       readyAudioCount: 0,
       failedCount: 0,
       cacheType: "temporary"
-    };
-
-    try {
-      cache = await this.getCacheSnapshot(resolvedChapterId);
-    } catch (_cacheError) {
-      cache = {
-        chunkCount: 0,
-        readyAudioCount: 0,
-        failedCount: 0,
-        cacheType: "temporary"
-      };
-    }
-
+    }));
     const session = await this.loadSession(resolvedChapterId);
+
     if (!session) {
       return createRuntimeState({
         chapterId: resolvedChapterId,
@@ -263,9 +202,6 @@ export class PlaybackQueue {
         readyAudioCount: cache.readyAudioCount || 0,
         chapterReadyAudioCount: cache.readyAudioCount || 0,
         failedCount: cache.failedCount || 0,
-        startupReadyAudioCount: 0,
-        startupTargetReadyAudioCount: 0,
-        startupBufferingComplete: false,
         cacheType: cache.cacheType || "temporary",
         generatedCount: cache.readyAudioCount || 0,
         lastEvent,
@@ -278,6 +214,7 @@ export class PlaybackQueue {
       ...session,
       state: "error",
       playbackStatus: "error",
+      streamStatus: "error",
       lastEvent,
       errorMessage: String(error)
     };
@@ -321,6 +258,13 @@ export class PlaybackQueue {
       lastRetryReason: null,
       lastRetryKind: null,
       lastCompletedChunkId: null,
+      transportMode: "live_stream",
+      streamStatus: "idle",
+      bytesReceived: 0,
+      bufferedAudioMs: 0,
+      firstByteAt: null,
+      firstAudioAt: null,
+      stallCount: 0,
       ...overrides
     };
   }
@@ -335,19 +279,18 @@ export class PlaybackQueue {
       playbackStatus: "idle",
       currentChunkIndex: 0,
       currentChunkId: null,
-      pageDetected: session.pageDetected ?? true,
-      pageEligible: session.pageEligible ?? true,
-      autoplayAllowed: session.autoplayAllowed ?? false,
-      startupReadyAudioCount: 0,
-      startupTargetReadyAudioCount: 0,
-      startupBufferingComplete: false,
-      hasStartedPlayback: false,
       playbackAttemptId: null,
       retryCount: 0,
       lastRetryReason: null,
       lastRetryKind: null,
       lastCompletedChunkId: null,
       errorMessage: null,
+      streamStatus: "idle",
+      bytesReceived: 0,
+      bufferedAudioMs: 0,
+      firstByteAt: null,
+      firstAudioAt: null,
+      stallCount: 0,
       ...overrides
     };
   }
@@ -366,28 +309,13 @@ export class PlaybackQueue {
           playRequested: true,
           playbackStatus: "playing",
           state: "awaiting_chunk_end",
+          streamStatus: "playing",
           lastEvent: "session_resumed",
           errorMessage: null
         };
         await this.saveSession(resumedSession);
-        this.log("session_resumed", resumedSession, { chunkId: resumedSession.currentChunkId });
         return this.getState(activeChapterId);
       }
-
-      const resumedSession = {
-        ...existingSession,
-        paused: false,
-        stopped: false,
-        playRequested: true,
-        playbackStatus: "idle",
-        state: "preparing",
-        lastEvent: "session_resume_fallback_requested"
-      };
-      await this.saveSession(resumedSession);
-      this.log("session_resume_fallback_requested", resumedSession, { chapterId: activeChapterId });
-      await this.ensureOffscreenDocument();
-      await this.processSession(activeChapterId);
-      return this.getState(activeChapterId);
     }
 
     if (existingSession?.text && existingSession.state !== "error") {
@@ -401,15 +329,10 @@ export class PlaybackQueue {
             paused: false,
             stopped: false,
             playRequested: true,
-            playbackStatus:
-              existingSession.playbackStatus === "paused" || existingSession.playbackStatus === "ended"
-                ? "idle"
-                : existingSession.playbackStatus,
-            state: existingSession.state === "ended" ? "preparing" : existingSession.state,
+            state: existingSession.state === "startup_ready" ? "playback_starting" : existingSession.state,
             lastEvent: "play_requested"
           };
       await this.saveSession(resumedWarmSession);
-      this.log(resumedWarmSession.lastEvent, resumedWarmSession, { chapterId: activeChapterId });
       await this.ensureOffscreenDocument();
       await this.processSession(activeChapterId);
       return this.getState(activeChapterId);
@@ -428,7 +351,6 @@ export class PlaybackQueue {
       lastEvent: "session_created"
     });
 
-    this.log("session_created", nextSession, { title: nextSession.title });
     await this.cleanupExpiredAudioRecords();
     await this.ensureOffscreenDocument();
     await this.ensureChapterData(nextSession);
@@ -448,15 +370,11 @@ export class PlaybackQueue {
     const existingSession = await this.loadSession(chapterId);
     await this.setActiveChapterId(chapterId);
 
-    if (
-      existingSession &&
-      existingSession.text === playbackInput.text &&
-      existingSession.partId === playbackInput.partId &&
-      existingSession.state !== "error"
-    ) {
+    if (existingSession && existingSession.text === playbackInput.text && existingSession.state !== "error") {
       const resumedWarmSession = existingSession.stopped || existingSession.state === "ended"
         ? this.createRestartedSession(existingSession, {
             playRequested: false,
+            state: "startup_ready",
             lastEvent: "session_warmup_resumed"
           })
         : {
@@ -464,26 +382,23 @@ export class PlaybackQueue {
             paused: false,
             stopped: false,
             playRequested: false,
+            state: "startup_ready",
             lastEvent: "session_warmup_resumed"
           };
       await this.saveSession(resumedWarmSession);
-      this.log("session_warmup_resumed", resumedWarmSession, { chapterId });
-      await this.ensureOffscreenDocument();
-      await this.processSession(chapterId);
       return this.getState(chapterId);
     }
 
     const nextSession = this.createSessionFromInput(playbackInput, {
       playRequested: false,
+      state: "startup_ready",
       lastEvent: "session_warmup_started"
     });
 
-    this.log("session_warmup_started", nextSession, { title: nextSession.title });
     await this.cleanupExpiredAudioRecords();
     await this.ensureOffscreenDocument();
     await this.ensureChapterData(nextSession);
     await this.saveSession(nextSession);
-    await this.processSession(chapterId);
 
     return this.getState(chapterId);
   }
@@ -501,6 +416,7 @@ export class PlaybackQueue {
       playRequested: false,
       state: "paused",
       playbackStatus: "paused",
+      streamStatus: "paused",
       lastEvent: "session_paused"
     };
     await this.saveSession(pausedSession);
@@ -518,6 +434,7 @@ export class PlaybackQueue {
         playRequested: false,
         state: "ended",
         playbackStatus: "ended",
+        streamStatus: "ended",
         currentChunkId: null,
         lastEvent: "session_stopped"
       };
@@ -546,158 +463,37 @@ export class PlaybackQueue {
         createdAt: Date.now(),
         expiresAt: Date.now() + 24 * 60 * 60 * 1000
       });
-      await replaceChapterData(
-        session.chapterId,
-        chunks.map((chunk) => ({ ...chunk, status: "pending" }))
-      );
-      this.log("chapter_data_replaced", session, { totalChunks: chunks.length });
+      await replaceChapterData(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
       return;
     }
 
     const existing = await getChunksByChapter(session.chapterId);
     if (!existing.length) {
-      await replaceChapterData(
-        session.chapterId,
-        chunks.map((chunk) => ({ ...chunk, status: "pending" }))
-      );
-      this.log("chapter_data_seeded", session, { totalChunks: chunks.length });
+      await replaceChapterData(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
     } else {
       session.totalChunks = existing.length;
     }
   }
 
   getProvider(session) {
-    if (session.providerMode === "modal" || session.providerMode === "proxy-local") {
-      return new ModalKokoroProvider("http://localhost:3000/tts");
+    if (session.providerMode === "direct-local") {
+      return new LocalKokoroProvider("http://localhost:8880");
     }
 
-    return new LocalKokoroProvider("http://localhost:8880");
+    return new ModalKokoroProvider("http://localhost:3000");
   }
 
   async processSession(chapterId = DEFAULT_CHAPTER_ID) {
     const session = await this.loadSession(chapterId);
-    if (!session || session.paused || session.stopped || session.state === "error") {
+    if (!session || session.paused || session.stopped || session.state === "error" || !session.playRequested) {
       return;
     }
 
     await this.ensureOffscreenDocument();
-    if (!session.playRequested) {
-      await this.fillBuffer(chapterId);
-      return;
-    }
-
-    if (this.isStartupPending(session)) {
-      await this.fillBuffer(chapterId);
-      await this.playCurrentChunkIfReady(chapterId);
-      return;
-    }
-
-    const startedPlayback = await this.playCurrentChunkIfReady(chapterId);
-    await this.fillBuffer(chapterId);
-
-    if (!startedPlayback) {
-      await this.playCurrentChunkIfReady(chapterId);
-    }
+    await this.startCurrentChunkStream(chapterId);
   }
 
-  async fillBuffer(chapterId = DEFAULT_CHAPTER_ID) {
-    let session = await this.loadSession(chapterId);
-    if (!session || session.paused || session.stopped || session.state === "error") {
-      return;
-    }
-
-    const provider = this.getProvider(session);
-    let readyCount = await this.getReadyAudioCount(session.chapterId, session.currentChunkIndex);
-    session = await this.updateStartupBufferState(session, readyCount);
-
-    while (readyCount < TARGET_READY_CHUNKS && readyCount < MAX_READY_CHUNKS) {
-      session = await this.loadSession(chapterId);
-      if (!session || session.paused || session.stopped || session.state === "error") {
-        return;
-      }
-
-      const nextChunk = await this.getNextPendingChunkRecord(session.chapterId, session.currentChunkIndex);
-      if (!nextChunk) {
-        break;
-      }
-
-      if (!["dispatching", "starting", "playing", "awaiting_chunk_end"].includes(session.playbackStatus)) {
-        session.state = this.isStartupPending(session) ? "startup_buffering" : "buffering";
-      }
-      session.lastEvent = "chunk_synthesis_started";
-      await this.saveSession(session);
-      await this.setChunkStatus(nextChunk.chunkId, "generating");
-      this.log("chunk_synthesis_started", session, { chunkId: nextChunk.chunkId });
-
-      try {
-        const audioBlob = await provider.synthesize({
-          text: nextChunk.text,
-          voice: session.voice,
-          format: "wav"
-        });
-        await this.saveChunkAudio({
-          chunkId: nextChunk.chunkId,
-          chapterId: session.chapterId,
-          chunkIndex: nextChunk.chunkIndex,
-          mimeType: "audio/wav",
-          audioBlob,
-          createdAt: Date.now(),
-          expiresAt: Date.now() + 24 * 60 * 60 * 1000
-        });
-        await this.setChunkStatus(nextChunk.chunkId, "ready");
-        session = (await this.loadSession(chapterId)) || session;
-        session.lastEvent = "chunk_synthesized";
-        readyCount = await this.getReadyAudioCount(session.chapterId, session.currentChunkIndex);
-        session = await this.updateStartupBufferState(session, readyCount);
-        this.log("chunk_synthesized", session, { chunkId: nextChunk.chunkId });
-        await this.playCurrentChunkIfReady(chapterId);
-      } catch (error) {
-        session = (await this.loadSession(chapterId)) || session;
-        await this.setChunkStatus(nextChunk.chunkId, "failed");
-        const failedSession = {
-          ...session,
-          state: "error",
-          playbackStatus: "error",
-          lastEvent: "chunk_synthesis_failed",
-          errorMessage: String(error)
-        };
-        await this.saveSession(failedSession);
-        this.log("chunk_synthesis_failed", failedSession, { chunkId: nextChunk.chunkId, error: String(error) });
-        return;
-      }
-
-      session = await this.loadSession(chapterId);
-      if (!session || session.paused || session.stopped || session.state === "error") {
-        return;
-      }
-
-      readyCount = await this.getReadyAudioCount(session.chapterId, session.currentChunkIndex);
-      session = await this.updateStartupBufferState(session, readyCount);
-    }
-
-    session = await this.loadSession(chapterId);
-    if (!session || session.paused || session.stopped || session.state === "error") {
-      return;
-    }
-
-    if (!["dispatching", "starting", "playing", "awaiting_chunk_end"].includes(session.playbackStatus)) {
-      const nextState = this.isStartupPending(session)
-        ? session.startupBufferingComplete
-          ? "startup_ready"
-          : "startup_buffering"
-        : readyCount > 0
-          ? "preparing"
-          : "buffering";
-      if (session.state !== nextState) {
-        await this.saveSession({
-          ...session,
-          state: nextState
-        });
-      }
-    }
-  }
-
-  async playCurrentChunkIfReady(chapterId = DEFAULT_CHAPTER_ID) {
+  async startCurrentChunkStream(chapterId = DEFAULT_CHAPTER_ID) {
     const session = await this.loadSession(chapterId);
     if (!session || session.paused || session.stopped || session.state === "error") {
       return false;
@@ -708,87 +504,75 @@ export class PlaybackQueue {
         ...session,
         state: "ended",
         playbackStatus: "ended",
+        streamStatus: "ended",
         currentChunkId: null,
         lastEvent: "session_ended"
       };
       await this.saveSession(endedSession);
-      this.log("session_ended", endedSession);
       return false;
     }
 
-    const audio = await this.getAudioChunkRecord(chapterId, session.currentChunkIndex);
-    if (!audio) {
-      if (!session.currentChunkId && session.state !== "buffering") {
-        await this.saveSession({
-          ...session,
-          state: this.isStartupPending(session) ? "startup_buffering" : "buffering",
-          playbackStatus: "idle",
-          lastEvent: this.isStartupPending(session) ? "startup_buffer_waiting" : "awaiting_audio_chunk"
-        });
-      }
+    const chunk = await this.getChunkRecord(chapterId, session.currentChunkIndex);
+    if (!chunk) {
       return false;
     }
 
-    if (this.isStartupPending(session)) {
-      const readyCount = await this.getReadyAudioCount(chapterId, session.currentChunkIndex);
-      const updatedSession = await this.updateStartupBufferState(session, readyCount);
-      if (readyCount < updatedSession.startupTargetReadyAudioCount) {
-        return false;
-      }
-      session.startupReadyAudioCount = updatedSession.startupReadyAudioCount;
-      session.startupTargetReadyAudioCount = updatedSession.startupTargetReadyAudioCount;
-      session.startupBufferingComplete = updatedSession.startupBufferingComplete;
-      session.state = "startup_ready";
-      session.lastEvent = "startup_buffer_ready";
-    }
-
-    if (!shouldDispatchChunk(session, audio.chunkId)) {
+    if (!shouldDispatchChunk(session, chunk.chunkId)) {
       return true;
     }
 
     const offscreenStatus = await this.queryOffscreenPlaybackStatus();
-    if (offscreenStatus.chunkId === audio.chunkId && (offscreenStatus.playing || offscreenStatus.ended)) {
+    if (offscreenStatus.chunkId === chunk.chunkId && ["connecting", "buffering", "receiving", "playing", "paused"].includes(offscreenStatus.streamStatus)) {
       return true;
     }
-    if (offscreenStatus.chunkId === audio.chunkId && offscreenStatus.error) {
+    if (offscreenStatus.chunkId === chunk.chunkId && offscreenStatus.error) {
       await this.stopOffscreenPlayback();
     }
 
-    const attemptId = this.getNextPlaybackAttemptId(session);
+    const attemptId = `${session.chapterId}:attempt:${(session.nextPlaybackAttemptSequence || 0) + 1}`;
     const scheduledSession = {
-      ...markChunkScheduled(session, audio),
+      ...markChunkScheduled(session, chunk),
       playbackAttemptId: attemptId,
       nextPlaybackAttemptSequence: (session.nextPlaybackAttemptSequence || 0) + 1,
       playbackStatus: "starting",
-      lastEvent: "playback_dispatch_requested"
+      state: "playback_starting",
+      streamStatus: "connecting",
+      bytesReceived: 0,
+      bufferedAudioMs: 0,
+      firstByteAt: null,
+      firstAudioAt: null,
+      lastEvent: "stream_dispatch_requested"
     };
     await this.saveSession(scheduledSession);
-    this.log("playback_dispatch_requested", scheduledSession, {
-      chunkId: audio.chunkId,
-      chunkIndex: audio.chunkIndex,
-      attemptId
-    });
 
     try {
-      const response = await this.dispatchChunkPlayback(audio.chunkId, chapterId, attemptId);
+      const provider = this.getProvider(scheduledSession);
+      const response = await this.dispatchStreamPlayback({
+        chunkId: chunk.chunkId,
+        chapterId,
+        attemptId,
+        request: provider.createStreamRequest({
+          text: chunk.text,
+          voice: scheduledSession.voice,
+          format: "wav"
+        })
+      });
       if (!response?.ok) {
-        throw new Error(response?.error || `Failed to dispatch playback for ${audio.chunkId}`);
+        throw new Error(response?.error || `Failed to dispatch playback for ${chunk.chunkId}`);
       }
-
-      const startedSession = markPlaybackStarted(scheduledSession, audio.chunkId, attemptId);
-      await this.saveSession(startedSession);
-      this.log("playback_started", startedSession, { chunkId: audio.chunkId, attemptId });
+      await this.saveSession({
+        ...scheduledSession,
+        lastEvent: "stream_dispatch_accepted"
+      });
       return true;
     } catch (error) {
       const currentSession = (await this.loadSession(chapterId)) || scheduledSession;
       const result = String(error).includes("AbortError")
-        ? applyPlaybackInterrupted(currentSession, audio.chunkId, String(error), attemptId)
-        : applyPlaybackError(currentSession, audio.chunkId, String(error), attemptId);
-      await this.saveSession(result.session);
-      this.log(result.retryScheduled ? result.session.lastEvent : "playback_failed", result.session, {
-        chunkId: audio.chunkId,
-        error: String(error),
-        attemptId
+        ? applyPlaybackInterrupted(currentSession, chunk.chunkId, String(error), attemptId)
+        : applyPlaybackError(currentSession, chunk.chunkId, String(error), attemptId);
+      await this.saveSession({
+        ...result.session,
+        streamStatus: result.retryScheduled ? "idle" : "error"
       });
       if (result.retryScheduled) {
         await this.processSession(chapterId);
@@ -798,59 +582,72 @@ export class PlaybackQueue {
   }
 
   async handleRuntimeMessage(message) {
-    if (message?.type === "CHUNK_PLAYBACK_STARTED") {
-      const chapterId = message.chapterId || DEFAULT_CHAPTER_ID;
-      const session = await this.loadSession(chapterId);
-      if (!session || session.stopped) {
-        return;
-      }
-
-      const startedSession = markPlaybackStarted(session, message.chunkId, message.attemptId || null);
-      await this.saveSession(startedSession);
-      this.log("playback_started", startedSession, { chunkId: message.chunkId, attemptId: message.attemptId || null });
+    const chapterId = message.chapterId || DEFAULT_CHAPTER_ID;
+    const session = await this.loadSession(chapterId);
+    if (!session || session.stopped) {
       return;
     }
 
-    if (message?.type === "CHUNK_PLAYBACK_ENDED") {
-      const chapterId = message.chapterId || DEFAULT_CHAPTER_ID;
-      const session = await this.loadSession(chapterId);
-      if (!session || session.stopped) {
+    if (message.type === "STREAM_PLAYBACK_PROGRESS") {
+      if (session.currentChunkId !== message.chunkId) {
         return;
       }
 
+      await this.saveSession({
+        ...session,
+        streamStatus: message.streamStatus || session.streamStatus || "idle",
+        bytesReceived: message.bytesReceived || 0,
+        bufferedAudioMs: message.bufferedAudioMs || 0,
+        firstByteAt: message.firstByteAt || session.firstByteAt || null,
+        firstAudioAt: message.firstAudioAt || session.firstAudioAt || null,
+        stallCount:
+          message.streamStatus === "buffering" && session.streamStatus !== "buffering"
+            ? (session.stallCount || 0) + 1
+            : session.stallCount || 0
+      });
+      return;
+    }
+
+    if (message.type === "CHUNK_PLAYBACK_STARTED") {
+      const startedSession = {
+        ...markPlaybackStarted(session, message.chunkId, message.attemptId || null),
+        streamStatus: "playing",
+        bytesReceived: message.bytesReceived || session.bytesReceived || 0,
+        bufferedAudioMs: message.bufferedAudioMs || session.bufferedAudioMs || 0,
+        firstByteAt: message.firstByteAt || session.firstByteAt || Date.now(),
+        firstAudioAt: message.firstAudioAt || session.firstAudioAt || Date.now()
+      };
+      await this.saveSession(startedSession);
+      return;
+    }
+
+    if (message.type === "CHUNK_PLAYBACK_ENDED") {
       const result = applyPlaybackEnded(session, message.chunkId, message.attemptId || null);
       if (!result.advanced) {
-        this.log("playback_end_ignored", session, { chunkId: message.chunkId, attemptId: message.attemptId || null });
         return;
       }
-
-      await this.saveSession(result.session);
-      this.log("chunk_playback_ended", result.session, { chunkId: message.chunkId, attemptId: message.attemptId || null });
-
+      await this.saveSession({
+        ...result.session,
+        streamStatus: result.session.state === "ended" ? "ended" : "idle",
+        bytesReceived: 0,
+        bufferedAudioMs: 0
+      });
       if (result.session.state !== "ended") {
         await this.processSession(chapterId);
       }
       return;
     }
 
-    if (message?.type === "CHUNK_PLAYBACK_INTERRUPTED") {
-      const chapterId = message.chapterId || DEFAULT_CHAPTER_ID;
-      const session = await this.loadSession(chapterId);
-      if (!session) {
-        return;
-      }
-
+    if (message.type === "CHUNK_PLAYBACK_INTERRUPTED") {
       const result = applyPlaybackInterrupted(
         session,
         message.chunkId,
         message.error || "Playback start interrupted",
         message.attemptId || null
       );
-      await this.saveSession(result.session);
-      this.log(result.retryScheduled ? result.session.lastEvent : "playback_failed", result.session, {
-        chunkId: message.chunkId,
-        error: message.error || "Playback start interrupted",
-        attemptId: message.attemptId || null
+      await this.saveSession({
+        ...result.session,
+        streamStatus: result.retryScheduled ? "idle" : "error"
       });
       if (result.retryScheduled) {
         await this.processSession(chapterId);
@@ -858,24 +655,16 @@ export class PlaybackQueue {
       return;
     }
 
-    if (message?.type === "CHUNK_PLAYBACK_ERROR") {
-      const chapterId = message.chapterId || DEFAULT_CHAPTER_ID;
-      const session = await this.loadSession(chapterId);
-      if (!session) {
-        return;
-      }
-
+    if (message.type === "CHUNK_PLAYBACK_ERROR") {
       const result = applyPlaybackError(
         session,
         message.chunkId,
         message.error || "Playback failed",
         message.attemptId || null
       );
-      await this.saveSession(result.session);
-      this.log(result.retryScheduled ? "playback_retry_scheduled" : "playback_failed", result.session, {
-        chunkId: message.chunkId,
-        error: message.error || "Playback failed",
-        attemptId: message.attemptId || null
+      await this.saveSession({
+        ...result.session,
+        streamStatus: result.retryScheduled ? "idle" : "error"
       });
       if (result.retryScheduled) {
         await this.processSession(chapterId);
@@ -891,7 +680,7 @@ export class PlaybackQueue {
     await chrome.offscreen.createDocument({
       url: "src/offscreen/offscreen.html",
       reasons: [chrome.offscreen.Reason.AUDIO_PLAYBACK],
-      justification: "Play temporary buffered audio chunks outside the popup"
+      justification: "Play live-streamed audio chunks outside the popup"
     });
   }
 
@@ -1050,10 +839,16 @@ export class PlaybackQueue {
       retryCount: 0,
       lastRetryReason: null,
       lastRetryKind: null,
-      lastCompletedChunkId: null
+      lastCompletedChunkId: null,
+      transportMode: "live_stream",
+      streamStatus: "error",
+      bytesReceived: 0,
+      bufferedAudioMs: 0,
+      firstByteAt: null,
+      firstAudioAt: null,
+      stallCount: 0
     };
 
-    this.log("extraction_failed", session, { error: session.errorMessage });
     await this.setActiveChapterId(chapterId);
     await this.saveSession(session);
     return this.getState(chapterId);

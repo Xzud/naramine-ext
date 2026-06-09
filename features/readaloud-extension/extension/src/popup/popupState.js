@@ -28,16 +28,22 @@ function formatProgress(state) {
 
 function formatStartupProgress(state) {
   if (!state.stateAvailable) {
-    return "Startup buffer: unavailable";
+    return "Startup stream buffer: unavailable";
   }
 
-  if (!state.startupTargetReadyAudioCount) {
-    return "Startup buffer: n/a";
+  if (state.firstAudioAt) {
+    return `Startup stream buffer: live (${state.bufferedAudioMs || 0} ms buffered)`;
   }
 
-  const readyCount = Math.min(state.startupReadyAudioCount || 0, state.startupTargetReadyAudioCount);
-  const suffix = state.startupBufferingComplete ? "ready to start playback" : "ready before playback start";
-  return `Startup buffer: ${readyCount} / ${state.startupTargetReadyAudioCount} ${suffix}`;
+  if (state.streamStatus === "connecting" || state.streamStatus === "receiving" || state.streamStatus === "buffering") {
+    return `Startup stream buffer: ${state.bufferedAudioMs || 0} ms buffered`;
+  }
+
+  if (!state.playRequested) {
+    return "Startup stream buffer: waiting for play";
+  }
+
+  return "Startup stream buffer: pending";
 }
 
 function formatSessionState(state) {
@@ -76,7 +82,7 @@ function formatPlayback(state) {
   }
 
   if (state.transportStatus === "starting") {
-    return "starting playback";
+    return "starting stream playback";
   }
 
   if (!state.playRequested && ["preparing", "startup_buffering"].includes(state.state)) {
@@ -87,8 +93,8 @@ function formatPlayback(state) {
     return "ready when you press play";
   }
 
-  if (state.playRequested && state.state === "startup_buffering") {
-    return "waiting for startup buffer";
+  if (state.playRequested && ["playback_starting", "preparing", "startup_buffering"].includes(state.state)) {
+    return "waiting for live stream";
   }
 
   if (state.playRequested && state.state === "startup_ready" && state.playbackStatus === "idle") {
@@ -146,11 +152,11 @@ export function buildPopupViewModel(inputState) {
       playback: "Playback: unavailable",
       progress: "Current chunk: unavailable",
       chunk: "Chunk ID: unavailable",
-      startup: "Startup buffer: unavailable",
+      startup: "Startup stream buffer: unavailable",
       warmup: "Warmup: unavailable",
       transport: "Transport: unavailable",
       intent: "Intent: unavailable",
-      buffer: "Ready audio cache: unavailable",
+      buffer: "Live stream buffer: unavailable",
       cache: "Cache: unavailable",
       source: "Extraction: unavailable",
       part: "Part ID: unavailable",
@@ -172,7 +178,7 @@ export function buildPopupViewModel(inputState) {
     warmup: formatWarmupStatus(state),
     transport: formatTransportStatus(state),
     intent: formatIntent(state),
-    buffer: `Ready audio cache: ${state.chapterReadyAudioCount ?? state.readyAudioCount}`,
+    buffer: `Live stream buffer: ${state.bufferedAudioMs || 0} ms, ${state.bytesReceived || 0} bytes`,
     cache: `Cache: ${state.cacheType}`,
     source: formatConfidence(state.extractionStrategy, state.extractionConfidence),
     part: `Part ID: ${state.partId || "none"}`,

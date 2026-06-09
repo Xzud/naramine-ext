@@ -13,100 +13,71 @@ test("popup-safe unavailable state does not invent playback metrics", () => {
   assert.equal(view.warmup, "Warmup: unavailable");
   assert.equal(view.transport, "Transport: unavailable");
   assert.match(view.error, /could not be reached/i);
-  assert.equal(view.progress.includes("0 / 0"), false);
 });
 
-test("popup shows startup buffer progress separately from ready audio cache", () => {
+test("popup shows live stream startup metrics before first audio", () => {
   const view = buildPopupViewModel({
     stateAvailable: true,
-    state: "startup_buffering",
-    warmupStatus: "warming",
-    transportStatus: "idle",
-    playRequested: false,
-    playbackStatus: "idle",
-    currentChunkIndex: 0,
-    totalChunks: 9,
-    currentChunkId: null,
-    chapterReadyAudioCount: 2,
-    readyAudioCount: 2,
-    startupReadyAudioCount: 2,
-    startupTargetReadyAudioCount: 3,
-    startupBufferingComplete: false,
-    extractionStrategy: "dom-paragraphs",
-    extractionConfidence: "high",
-    cacheType: "temporary",
-    partId: "1407678433",
-    lastEvent: "startup_buffer_progress",
-    errorMessage: null
-  });
-
-  assert.equal(view.state, "Session state: warming chapter in background");
-  assert.equal(view.startup, "Startup buffer: 2 / 3 ready before playback start");
-  assert.equal(view.warmup, "Warmup: warming");
-  assert.equal(view.transport, "Transport: idle");
-  assert.equal(view.buffer, "Ready audio cache: 2");
-  assert.equal(view.playback, "Playback: warming in background");
-});
-
-test("popup distinguishes play-requested startup wait from passive warmup", () => {
-  const view = buildPopupViewModel({
-    stateAvailable: true,
-    state: "startup_buffering",
+    state: "playback_starting",
     warmupStatus: "starting",
-    transportStatus: "queued",
+    transportStatus: "starting",
     playRequested: true,
-    playbackStatus: "idle",
+    playbackStatus: "starting",
+    streamStatus: "buffering",
     currentChunkIndex: 0,
     totalChunks: 9,
-    currentChunkId: null,
-    chapterReadyAudioCount: 2,
-    readyAudioCount: 2,
-    startupReadyAudioCount: 2,
-    startupTargetReadyAudioCount: 3,
-    startupBufferingComplete: false,
+    currentChunkId: "chunk-0",
+    chapterReadyAudioCount: 0,
+    readyAudioCount: 0,
+    bufferedAudioMs: 180,
+    bytesReceived: 24000,
+    firstByteAt: 123,
+    firstAudioAt: null,
     extractionStrategy: "dom-paragraphs",
     extractionConfidence: "high",
     cacheType: "temporary",
     partId: "1407678433",
-    lastEvent: "startup_buffer_progress",
+    lastEvent: "stream_dispatch_accepted",
     errorMessage: null
   });
 
   assert.equal(view.state, "Session state: preparing playback start");
-  assert.equal(view.warmup, "Warmup: starting");
-  assert.equal(view.transport, "Transport: queued");
-  assert.equal(view.playback, "Playback: waiting for startup buffer");
+  assert.equal(view.startup, "Startup stream buffer: 180 ms buffered");
+  assert.equal(view.transport, "Transport: starting");
+  assert.equal(view.playback, "Playback: starting stream playback");
+  assert.equal(view.buffer, "Live stream buffer: 180 ms, 24000 bytes");
 });
 
-test("popup makes interrupted startup retry explicit", () => {
+test("popup distinguishes passive warmup from play-requested streaming", () => {
   const view = buildPopupViewModel({
     stateAvailable: true,
     state: "startup_ready",
-    warmupStatus: "starting",
-    transportStatus: "queued",
-    playRequested: true,
+    warmupStatus: "warm_ready",
+    transportStatus: "idle",
+    playRequested: false,
     playbackStatus: "idle",
+    streamStatus: "idle",
     currentChunkIndex: 0,
-    totalChunks: 4,
+    totalChunks: 9,
     currentChunkId: null,
-    chapterReadyAudioCount: 3,
-    readyAudioCount: 3,
-    startupReadyAudioCount: 3,
-    startupTargetReadyAudioCount: 3,
-    startupBufferingComplete: true,
+    chapterReadyAudioCount: 0,
+    readyAudioCount: 0,
+    bufferedAudioMs: 0,
+    bytesReceived: 0,
     extractionStrategy: "dom-paragraphs",
     extractionConfidence: "high",
     cacheType: "temporary",
     partId: "1407678433",
-    lastEvent: "playback_start_interrupted_retry_scheduled",
-    errorMessage: "AbortError"
+    lastEvent: "chapter_ready_for_streaming",
+    errorMessage: null
   });
 
-  assert.equal(view.playback, "Playback: retrying interrupted startup");
-  assert.equal(view.transport, "Transport: queued");
+  assert.equal(view.state, "Session state: warm buffer ready");
+  assert.equal(view.playback, "Playback: ready when you press play");
+  assert.equal(view.startup, "Startup stream buffer: waiting for play");
 });
 
-test("popup shows a clearer playing session state once transport is active", () => {
+test("popup shows active streamed playback once transport is live", () => {
   const view = buildPopupViewModel({
     stateAvailable: true,
     state: "awaiting_chunk_end",
@@ -114,14 +85,16 @@ test("popup shows a clearer playing session state once transport is active", () 
     transportStatus: "playing",
     playRequested: true,
     playbackStatus: "playing",
+    streamStatus: "playing",
     currentChunkIndex: 1,
     totalChunks: 4,
     currentChunkId: "chunk-2",
-    chapterReadyAudioCount: 4,
-    readyAudioCount: 4,
-    startupReadyAudioCount: 3,
-    startupTargetReadyAudioCount: 3,
-    startupBufferingComplete: true,
+    chapterReadyAudioCount: 0,
+    readyAudioCount: 0,
+    bufferedAudioMs: 220,
+    bytesReceived: 56000,
+    firstByteAt: 10,
+    firstAudioAt: 20,
     extractionStrategy: "dom-paragraphs",
     extractionConfidence: "high",
     cacheType: "temporary",
@@ -131,7 +104,7 @@ test("popup shows a clearer playing session state once transport is active", () 
   });
 
   assert.equal(view.state, "Session state: ready for playback");
-  assert.equal(view.warmup, "Warmup: ready");
+  assert.equal(view.startup, "Startup stream buffer: live (220 ms buffered)");
   assert.equal(view.transport, "Transport: playing");
   assert.equal(view.playback, "Playback: playing");
 });
