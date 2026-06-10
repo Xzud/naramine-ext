@@ -1187,3 +1187,93 @@ test("near-end playback refreshes lazy-loaded chunks without dropping the active
     initial.chunks[16].paragraphIds
   );
 });
+
+test("clicking a paragraph starts playback from the matching chunk and highlights it", async () => {
+  const chapter = buildParagraphChapter(8, {
+    chapterId: "chapter-click",
+    storyId: "story-click",
+    title: "Click Chapter"
+  });
+  const queue = new LazyLoadPlaybackQueue({
+    chunkStore: chapter.chunks.map((chunk) => ({
+      ...chunk,
+      status: "pending"
+    })),
+    chapterRecord: chapter.chapter
+  });
+  queue.tabsApi.sendMessage = async (tabId, message) => {
+    queue.tabMessages.push({ tabId, message });
+
+    if (message.type === "READALOUD_EXTRACT_TEXT") {
+      return {
+        ok: true,
+        text: chapter.text,
+        title: chapter.chapter.title,
+        sourceUrl: chapter.chapter.sourceUrl,
+        storyId: chapter.chapter.storyId,
+        partId: chapter.chapter.chapterId,
+        strategy: "dom-paragraphs",
+        confidence: "high",
+        paragraphs: chapter.paragraphs
+      };
+    }
+
+    return { ok: true };
+  };
+
+  const state = await queue.playFromParagraph({
+    tabId: 333,
+    paragraphId: "p-5"
+  });
+
+  assert.equal(queue.sentMessages.some((message) => message.type === "STOP_PLAYBACK"), true);
+  assert.equal(queue.startedStreams.at(-1), "chapter-click");
+  assert.equal(state.currentChunkIndex, 5);
+  assert.equal(state.currentChunkId, chapter.chunks[5].chunkId);
+  assert.equal(queue.tabMessages.at(-1).message.type, "READALOUD_SET_ACTIVE_CHUNK");
+  assert.deepEqual(queue.tabMessages.at(-1).message.payload.paragraphIds, chapter.chunks[5].paragraphIds);
+});
+
+test("clicking an unknown paragraph fails without starting playback", async () => {
+  const chapter = buildParagraphChapter(4, {
+    chapterId: "chapter-missing",
+    storyId: "story-missing",
+    title: "Missing Paragraph Chapter"
+  });
+  const queue = new LazyLoadPlaybackQueue({
+    chunkStore: chapter.chunks.map((chunk) => ({
+      ...chunk,
+      status: "pending"
+    })),
+    chapterRecord: chapter.chapter
+  });
+  queue.tabsApi.sendMessage = async (tabId, message) => {
+    queue.tabMessages.push({ tabId, message });
+
+    if (message.type === "READALOUD_EXTRACT_TEXT") {
+      return {
+        ok: true,
+        text: chapter.text,
+        title: chapter.chapter.title,
+        sourceUrl: chapter.chapter.sourceUrl,
+        storyId: chapter.chapter.storyId,
+        partId: chapter.chapter.chapterId,
+        strategy: "dom-paragraphs",
+        confidence: "high",
+        paragraphs: chapter.paragraphs
+      };
+    }
+
+    return { ok: true };
+  };
+
+  const state = await queue.playFromParagraph({
+    tabId: 444,
+    paragraphId: "p-missing"
+  });
+
+  assert.equal(queue.sentMessages.some((message) => message.type === "STOP_PLAYBACK"), false);
+  assert.equal(queue.startedStreams.length, 0);
+  assert.equal(state.state, "error");
+  assert.match(state.errorMessage, /paragraph_not_found/);
+});

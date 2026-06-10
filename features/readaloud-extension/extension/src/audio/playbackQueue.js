@@ -204,6 +204,20 @@ export class PlaybackQueue {
     });
   }
 
+  async findChunkForParagraph(chapterId, paragraphId) {
+    if (!chapterId || !paragraphId) {
+      return null;
+    }
+
+    const chunkRecords = await this.getChapterChunkRecords(chapterId);
+    return (
+      chunkRecords.find((chunk) => {
+        const paragraphIds = Array.isArray(chunk.paragraphIds) ? chunk.paragraphIds.filter(Boolean) : [];
+        return paragraphIds.includes(paragraphId) || chunk.paragraphId === paragraphId;
+      }) || null
+    );
+  }
+
   isNearChapterEnd(session) {
     if (!session || typeof session.currentChunkIndex !== "number" || typeof session.totalChunks !== "number") {
       return false;
@@ -361,6 +375,85 @@ export class PlaybackQueue {
     await this.mergeChapterChunkData(refreshedSession, chapter, chunks, existingChunks);
     await this.saveSession(refreshedSession);
     return true;
+  }
+
+  async playFromParagraph(options = {}) {
+    const playbackInput = await this.resolvePlaybackInput({
+      ...options,
+      tabId: typeof options.tabId === "number" ? options.tabId : null
+    });
+    if (!playbackInput.ok) {
+      return this.saveExtractionError(playbackInput);
+    }
+
+    const chapterId = playbackInput.chapterId;
+    const clickedParagraphId = options.paragraphId || null;
+    await this.setActiveChapterId(chapterId);
+
+    const existingSession = await this.loadSession(chapterId);
+    const baseSession =
+      existingSession && existingSession.text === playbackInput.text && existingSession.state !== "error"
+        ? existingSession
+        : this.createSessionFromInput(playbackInput, {
+            playRequested: true,
+            lastEvent: "session_created_from_paragraph"
+          });
+
+    const preparedSession = {
+      ...baseSession,
+      tabId: typeof options.tabId === "number" ? options.tabId : baseSession.tabId || playbackInput.tabId || null,
+      playRequested: true,
+      paused: false,
+      stopped: false,
+      state: "playback_starting",
+      playbackStatus: "idle",
+      currentChunkIndex: typeof baseSession.currentChunkIndex === "number" ? baseSession.currentChunkIndex : 0,
+      currentChunkId: baseSession.currentChunkId || null,
+      playbackAttemptId: null,
+      lastEvent: "play_requested_from_paragraph",
+      errorMessage: null,
+      retryCount: 0,
+      lastRetryReason: null,
+      lastRetryKind: null,
+      streamStatus: "idle",
+      bytesReceived: 0,
+      bufferedAudioMs: 0,
+      firstByteAt: null,
+      firstAudioAt: null,
+      stallCount: 0
+    };
+
+    await this.ensureChapterData(preparedSession);
+
+    let targetChunk = await this.findChunkForParagraph(chapterId, clickedParagraphId);
+    if (!targetChunk) {
+      await this.refreshChapterDataFromPage({
+        ...preparedSession,
+        tabId: preparedSession.tabId || options.tabId || null
+      }).catch(() => {});
+      await this.ensureChapterData(preparedSession);
+      targetChunk = await this.findChunkForParagraph(chapterId, clickedParagraphId);
+    }
+
+    if (!targetChunk) {
+      return this.buildRequestFailureState(
+        chapterId,
+        `paragraph_not_found: could not find a chunk for paragraph ${clickedParagraphId || "-"}`,
+        "paragraph_not_found"
+      );
+    }
+
+    const nextSession = {
+      ...preparedSession,
+      currentChunkIndex: targetChunk.chunkIndex,
+      currentChunkId: targetChunk.chunkId
+    };
+
+    await this.saveSession(nextSession);
+    await this.focusChunkOnPage(nextSession, targetChunk.chunkId, { clearPrevious: true }).catch(() => {});
+    await this.stopOffscreenPlayback();
+    await this.processSession(chapterId);
+    return this.getState(chapterId);
   }
 
   async clearChunkFocus(session) {
@@ -1176,13 +1269,23 @@ export class PlaybackQueue {
       };
     }
 
-    let tabId = null;
+    let tabId = typeof options.tabId === "number" ? options.tabId : null;
     try {
-      const tabs = await chrome.tabs.query({
-        active: true,
-        currentWindow: true
-      });
-      tabId = tabs[0]?.id ?? null;
+      if (tabId === null) {
+        if (typeof this.tabsApi?.query !== "function") {
+          return {
+            ok: false,
+            chapterId: await this.getActiveChapterId(),
+            errorMessage: "No active Wattpad tab was found."
+          };
+        }
+
+        const tabs = await this.tabsApi.query({
+          active: true,
+          currentWindow: true
+        });
+        tabId = tabs[0]?.id ?? null;
+      }
     } catch (error) {
       return {
         ok: false,
@@ -1201,7 +1304,15 @@ export class PlaybackQueue {
 
     let extraction;
     try {
-      extraction = await chrome.tabs.sendMessage(tabId, {
+      if (typeof this.tabsApi?.sendMessage !== "function") {
+        return {
+          ok: false,
+          chapterId: await this.getActiveChapterId(),
+          errorMessage: "Failed to read the current Wattpad page: page messaging is unavailable."
+        };
+      }
+
+      extraction = await this.tabsApi.sendMessage(tabId, {
         type: "READALOUD_EXTRACT_TEXT"
       });
     } catch (error) {

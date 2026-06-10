@@ -16,6 +16,7 @@ const UI_PHRASES = [
 
 const DEFAULT_ACTIVE_CHUNK_CLASS = "readaloud-active-chunk";
 const DEFAULT_ACTIVE_CHUNK_STYLE_ID = "readaloud-active-chunk-style";
+const CLICKABLE_PARAGRAPH_STYLE_ID = "readaloud-clickable-paragraph-style";
 
 function cssEscape(value) {
   if (globalThis.CSS?.escape) {
@@ -37,6 +38,21 @@ function getParagraphNodes(documentRef, paragraphIds = []) {
     nodes.push(...documentRef.querySelectorAll(selector));
   }
   return nodes;
+}
+
+function ensureClickableParagraphStyles(documentRef) {
+  if (documentRef.getElementById?.(CLICKABLE_PARAGRAPH_STYLE_ID)) {
+    return;
+  }
+
+  const style = documentRef.createElement("style");
+  style.id = CLICKABLE_PARAGRAPH_STYLE_ID;
+  style.textContent = `
+    article.story-part[data-part-id] p[data-p-id] {
+      cursor: pointer;
+    }
+  `;
+  documentRef.head?.appendChild(style) || documentRef.documentElement?.appendChild(style);
 }
 
 function createChunkFocusController({
@@ -137,6 +153,58 @@ function createChunkFocusController({
     syncAfterMutation,
     getActiveChunkState: () => activeChunkState
   };
+}
+
+function getReadingChapterId(documentRef) {
+  const article =
+    documentRef.querySelector("main#parts-container-new article.story-part[data-part-id]") ||
+    documentRef.querySelector("article.story-part[data-part-id]");
+
+  return article?.dataset?.partId || findPartId(documentRef.documentElement?.outerHTML || "", documentRef.location?.href || "");
+}
+
+function isParagraphClickModifier(event) {
+  return Boolean(event?.metaKey || event?.ctrlKey || event?.altKey || event?.shiftKey);
+}
+
+function handleParagraphClick(event) {
+  if (!event || event.button !== 0 || isParagraphClickModifier(event)) {
+    return;
+  }
+
+  if (event.target?.closest?.("a, button, input, textarea, select, label")) {
+    return;
+  }
+
+  const paragraph = event.target?.closest?.("p[data-p-id]");
+  if (!paragraph?.dataset?.pId) {
+    return;
+  }
+
+  const selection = window.getSelection?.();
+  if (selection && !selection.isCollapsed) {
+    return;
+  }
+
+  const chapterId = getReadingChapterId(document);
+  if (!chapterId) {
+    return;
+  }
+
+  event.preventDefault?.();
+  event.stopPropagation?.();
+  chrome.runtime
+    .sendMessage({
+      scope: "readaloud",
+      type: "PLAY_FROM_PARAGRAPH",
+      payload: {
+        chapterId,
+        paragraphId: paragraph.dataset.pId
+      }
+    })
+    .catch(() => {
+      // Best-effort request; the playback queue will fail cleanly if unavailable.
+    });
 }
 
 function normalizeWhitespace(value) {
@@ -364,6 +432,8 @@ const chunkFocus = createChunkFocusController({
   windowRef: window
 });
 
+ensureClickableParagraphStyles(document);
+
 function extractWattpadTextFromDocument(documentRef) {
   const metadata = {
     title: documentRef.title || "",
@@ -499,6 +569,7 @@ notifyPageReadyIfChanged(document);
 document.addEventListener("visibilitychange", () => {
   schedulePageReadyCheck();
 });
+document.addEventListener("click", handleParagraphClick, true);
 window.addEventListener("popstate", schedulePageReadyCheck);
 window.addEventListener("hashchange", schedulePageReadyCheck);
 

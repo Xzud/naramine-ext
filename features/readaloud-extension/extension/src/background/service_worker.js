@@ -20,6 +20,11 @@ async function handleScopedRequest(message, sender) {
         ...(message.payload || {}),
         tabId: (message.payload || {}).tabId || tabId
       });
+    case "PLAY_FROM_PARAGRAPH":
+      return queue.playFromParagraph({
+        ...(message.payload || {}),
+        tabId: (message.payload || {}).tabId || tabId
+      });
     case "PAUSE":
       return queue.pause(message.payload?.chapterId || null);
     case "STOP":
