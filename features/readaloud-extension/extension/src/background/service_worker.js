@@ -7,12 +7,19 @@ function getChapterIdFromMessage(message) {
   return message?.payload?.chapterId || message?.chapterId || null;
 }
 
-async function handleScopedRequest(message) {
+async function handleScopedRequest(message, sender) {
+  const tabId = sender?.tab?.id ?? null;
   switch (message.type) {
     case "PAGE_READY":
-      return queue.warmup(message.payload || {});
+      return queue.warmup({
+        ...(message.payload || {}),
+        tabId
+      });
     case "PLAY":
-      return queue.start(message.payload || {});
+      return queue.start({
+        ...(message.payload || {}),
+        tabId: (message.payload || {}).tabId || tabId
+      });
     case "PAUSE":
       return queue.pause(message.payload?.chapterId || null);
     case "STOP":
@@ -38,7 +45,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   (async () => {
-    sendResponse(await handleScopedRequest(message));
+    sendResponse(await handleScopedRequest(message, _sender));
   })().catch((error) => {
     console.error("Service worker request failed", error);
     queue

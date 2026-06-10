@@ -14,6 +14,131 @@ const UI_PHRASES = [
   "sign up for free to keep reading"
 ];
 
+const DEFAULT_ACTIVE_CHUNK_CLASS = "readaloud-active-chunk";
+const DEFAULT_ACTIVE_CHUNK_STYLE_ID = "readaloud-active-chunk-style";
+
+function cssEscape(value) {
+  if (globalThis.CSS?.escape) {
+    return globalThis.CSS.escape(value);
+  }
+
+  return String(value).replace(/["\\]/g, "\\$&");
+}
+
+function getParagraphNodes(documentRef, paragraphIds = []) {
+  const ids = paragraphIds.filter(Boolean);
+  if (!ids.length) {
+    return [];
+  }
+
+  const nodes = [];
+  for (const paragraphId of ids) {
+    const selector = `p[data-p-id="${cssEscape(paragraphId)}"]`;
+    nodes.push(...documentRef.querySelectorAll(selector));
+  }
+  return nodes;
+}
+
+function createChunkFocusController({
+  documentRef,
+  windowRef = globalThis.window,
+  activeChunkClass = DEFAULT_ACTIVE_CHUNK_CLASS,
+  activeChunkStyleId = DEFAULT_ACTIVE_CHUNK_STYLE_ID
+} = {}) {
+  let activeChunkState = null;
+
+  function ensureActiveChunkStyles() {
+    if (documentRef.getElementById?.(activeChunkStyleId)) {
+      return;
+    }
+
+    const style = documentRef.createElement("style");
+    style.id = activeChunkStyleId;
+    style.textContent = `
+      .${activeChunkClass} {
+        background: rgba(255, 244, 205, 0.78) !important;
+        color: #f97316 !important;
+        border-left: 5px solid #f97316 !important;
+        box-shadow: inset 0 0 0 1px rgba(249, 115, 22, 0.28), 0 0 0 1px rgba(249, 115, 22, 0.08);
+        scroll-margin-top: 30vh;
+      }
+      .${activeChunkClass} * {
+        color: #f97316 !important;
+      }
+    `;
+    documentRef.head?.appendChild(style) || documentRef.documentElement?.appendChild(style);
+  }
+
+  function clearActiveChunkHighlight() {
+    if (!activeChunkState) {
+      return;
+    }
+
+    for (const node of getParagraphNodes(documentRef, activeChunkState.paragraphIds)) {
+      node.classList.remove(activeChunkClass);
+      node.removeAttribute?.("data-readaloud-active-chunk");
+    }
+
+    activeChunkState = null;
+  }
+
+  function applyActiveChunkHighlight(chunkState, { scroll = true } = {}) {
+    if (!chunkState?.chunkId) {
+      return { ok: false, reason: "missing_chunk" };
+    }
+
+    ensureActiveChunkStyles();
+
+    if (activeChunkState?.chunkId && activeChunkState.chunkId !== chunkState.chunkId) {
+      clearActiveChunkHighlight();
+    }
+
+    const nextParagraphIds = Array.isArray(chunkState.paragraphIds)
+      ? chunkState.paragraphIds.filter(Boolean)
+      : [];
+    const nodes = getParagraphNodes(documentRef, nextParagraphIds);
+    if (!nodes.length) {
+      activeChunkState = {
+        chunkId: chunkState.chunkId,
+        paragraphIds: nextParagraphIds
+      };
+      return { ok: false, reason: "no_anchor_found" };
+    }
+
+    activeChunkState = {
+      chunkId: chunkState.chunkId,
+      paragraphIds: nextParagraphIds
+    };
+
+    for (const node of nodes) {
+      node.classList.add(activeChunkClass);
+      node.dataset.readaloudActiveChunk = "true";
+    }
+
+    if (scroll && windowRef) {
+      const scrollTarget = nodes[0];
+      scrollTarget.scrollIntoView({ block: "center", inline: "nearest" });
+    }
+
+    return { ok: true };
+  }
+
+  function syncAfterMutation() {
+    if (!activeChunkState) {
+      return;
+    }
+
+    applyActiveChunkHighlight(activeChunkState, { scroll: false });
+  }
+
+  return {
+    focusChunk: applyActiveChunkHighlight,
+    clear: clearActiveChunkHighlight,
+    syncAfterMutation,
+    getActiveChunkState: () => activeChunkState
+  };
+}
+
 function normalizeWhitespace(value) {
   return value.replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
 }
@@ -136,8 +261,35 @@ function validateExtractedText(text, paragraphCount) {
 }
 
 function buildSuccess(paragraphs, metadata, strategy, confidence) {
-  const text = paragraphs.join("\n\n");
-  const validation = validateExtractedText(text, paragraphs.length);
+  const normalizedParagraphs = paragraphs
+    .map((paragraph, index) => {
+      if (typeof paragraph === "string") {
+        const text = paragraph.trim();
+        if (!text) {
+          return null;
+        }
+        return {
+          paragraphId: null,
+          text,
+          order: index
+        };
+      }
+
+      const text = (paragraph?.text || "").trim();
+      if (!text) {
+        return null;
+      }
+
+      return {
+        paragraphId: paragraph.paragraphId || paragraph.id || null,
+        text,
+        order: index
+      };
+    })
+    .filter(Boolean);
+
+  const text = normalizedParagraphs.map((paragraph) => paragraph.text).join("\n\n");
+  const validation = validateExtractedText(text, normalizedParagraphs.length);
 
   if (!validation.ok) {
     return buildFailure("could_not_isolate_wattpad_chapter_text", metadata, strategy, validation.warnings);
@@ -146,13 +298,14 @@ function buildSuccess(paragraphs, metadata, strategy, confidence) {
   return {
     ok: true,
     text,
+    paragraphs: normalizedParagraphs,
     title: metadata.title || "",
     sourceUrl: metadata.sourceUrl || "",
     strategy,
     storyId: metadata.storyId || null,
     partId: metadata.partId || null,
     partUrl: metadata.partUrl || metadata.sourceUrl || "",
-    paragraphCount: paragraphs.length,
+    paragraphCount: normalizedParagraphs.length,
     confidence,
     error: null,
     warnings: []
@@ -171,7 +324,11 @@ function extractEmbeddedStoryTextFromHtml(value, metadata) {
   for (const match of storyTextHtml.matchAll(pattern)) {
     const text = normalizeWhitespace(decodeHtmlEntities(stripNoiseHtml(match[1])));
     if (text) {
-      paragraphs.push(text);
+      const paragraphIdMatch = match[0].match(/data-p-id="([^"]+)"/i);
+      paragraphs.push({
+        paragraphId: paragraphIdMatch?.[1] || null,
+        text
+      });
     }
   }
 
@@ -202,6 +359,11 @@ function isWattpadReadingDocument(documentRef) {
   );
 }
 
+const chunkFocus = createChunkFocusController({
+  documentRef: document,
+  windowRef: window
+});
+
 function extractWattpadTextFromDocument(documentRef) {
   const metadata = {
     title: documentRef.title || "",
@@ -223,9 +385,12 @@ function extractWattpadTextFromDocument(documentRef) {
         for (const node of clone.querySelectorAll(".component-wrapper, .comment-marker, button, svg")) {
           node.remove();
         }
-        return normalizeWhitespace(clone.textContent || "");
+        return {
+          paragraphId: paragraph.dataset.pId || null,
+          text: normalizeWhitespace(clone.textContent || "")
+        };
       })
-      .filter(Boolean);
+      .filter((paragraph) => Boolean(paragraph.text));
 
     const domResult = buildSuccess(
       paragraphs,
@@ -285,9 +450,11 @@ let lastPageSignature = null;
 function notifyPageReadyIfChanged(documentRef) {
   const nextSignature = getPageSignature(documentRef);
   if (nextSignature === lastPageSignature) {
+    chunkFocus.syncAfterMutation();
     return;
   }
 
+  chunkFocus.clear();
   lastPageSignature = nextSignature;
   notifyPageReady(documentRef);
 }
@@ -307,6 +474,20 @@ function schedulePageReadyCheck() {
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type !== "READALOUD_EXTRACT_TEXT") {
+    if (message?.type === "READALOUD_SET_ACTIVE_CHUNK") {
+      const result = chunkFocus.focusChunk(message.payload || {}, {
+        scroll: message.payload?.scroll !== false
+      });
+      sendResponse(result);
+      return true;
+    }
+
+    if (message?.type === "READALOUD_CLEAR_ACTIVE_CHUNK") {
+      chunkFocus.clear();
+      sendResponse({ ok: true });
+      return true;
+    }
+
     return undefined;
   }
 

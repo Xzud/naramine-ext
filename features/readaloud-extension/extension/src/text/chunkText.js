@@ -58,34 +58,79 @@ function splitParagraph(paragraph) {
   return segments;
 }
 
+function normalizeSourceParagraphs(text, sourceParagraphs = []) {
+  if (Array.isArray(sourceParagraphs) && sourceParagraphs.length > 0) {
+    return sourceParagraphs
+      .map((paragraph, index) => {
+        if (typeof paragraph === "string") {
+          return {
+            text: paragraph.trim(),
+            paragraphIds: []
+          };
+        }
+
+        const textValue = (paragraph?.text || "").trim();
+        if (!textValue) {
+          return null;
+        }
+
+        const paragraphIds = Array.isArray(paragraph.paragraphIds)
+          ? paragraph.paragraphIds.filter(Boolean)
+          : paragraph.paragraphId
+            ? [paragraph.paragraphId]
+            : paragraph.id
+              ? [paragraph.id]
+              : [];
+
+        return {
+          text: textValue,
+          paragraphIds,
+          sourceIndex: index
+        };
+      })
+      .filter(Boolean);
+  }
+
+  return text
+    .split(/\n\s*\n/g)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+    .map((paragraph) => ({
+      text: paragraph,
+      paragraphIds: []
+    }));
+}
+
 export function chunkText(text, options = {}) {
   const storyId = options.storyId || DEFAULT_STORY_ID;
   const chapterId = options.chapterId || DEFAULT_CHAPTER_ID;
-  const paragraphs = text
-    .split(/\n\s*\n/g)
-    .map((paragraph) => paragraph.trim())
-    .filter(Boolean);
-
-  const pieces = paragraphs.flatMap(splitParagraph);
+  const sourceParagraphs = normalizeSourceParagraphs(text, options.paragraphs || []);
   const chunks = [];
   let chunkIndex = 0;
 
-  for (const piece of pieces) {
-    if (!piece) {
-      continue;
-    }
+  for (const paragraph of sourceParagraphs) {
+    const pieces = splitParagraph(paragraph.text);
+    for (const piece of pieces) {
+      if (!piece) {
+        continue;
+      }
 
-    const normalized = piece.trim().slice(0, MAX_CHUNK_CHARS);
-    const textHash = stableHash(`${storyId}:${chapterId}:${normalized}`);
-    chunks.push({
-      storyId,
-      chapterId,
-      chunkIndex,
-      text: normalized,
-      textHash,
-      chunkId: `${chapterId}:${chunkIndex}:${textHash}`
-    });
-    chunkIndex += 1;
+      const normalized = piece.trim().slice(0, MAX_CHUNK_CHARS);
+      const paragraphIds = Array.isArray(paragraph.paragraphIds) ? paragraph.paragraphIds : [];
+      const primaryParagraphId = paragraphIds[0] || null;
+      const textHash = stableHash(`${storyId}:${chapterId}:${normalized}`);
+      chunks.push({
+        storyId,
+        chapterId,
+        chunkIndex,
+        text: normalized,
+        textHash,
+        chunkId: `${chapterId}:${chunkIndex}:${textHash}`,
+        paragraphIds,
+        paragraphId: primaryParagraphId
+      });
+      chunkIndex += 1;
+    }
   }
 
   return chunks;

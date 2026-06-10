@@ -21,6 +21,8 @@ class TestPlaybackQueue extends PlaybackQueue {
   constructor(options = {}) {
     const listeners = [];
     const sentMessages = [];
+    const tabMessages = [];
+    const queriedTabs = options.queriedTabs || [{ id: 123 }];
     const runtimeStatus = options.runtimeStatus || {
       playing: false,
       paused: false,
@@ -49,8 +51,17 @@ class TestPlaybackQueue extends PlaybackQueue {
         return { ok: true };
       }
     };
+    const tabsApi = options.tabsApi || {
+      async sendMessage(tabId, message) {
+        tabMessages.push({ tabId, message });
+        return { ok: true };
+      },
+      async query() {
+        return queriedTabs;
+      }
+    };
     const storageArea = options.storageArea || new MemoryStorageArea();
-    super(runtimeApi, storageArea);
+    super(runtimeApi, storageArea, tabsApi);
     this.cacheSnapshot = options.cacheSnapshot || {
       chunkCount: 0,
       readyAudioCount: 0,
@@ -60,6 +71,7 @@ class TestPlaybackQueue extends PlaybackQueue {
     this.listeners = listeners;
     this.startedStreams = [];
     this.sentMessages = sentMessages;
+    this.tabMessages = tabMessages;
     this.processCalls = 0;
   }
 
@@ -86,7 +98,9 @@ class TestPlaybackQueue extends PlaybackQueue {
       chunkIndex,
       text: `Chunk ${chunkIndex}`,
       textHash: `hash-${chunkIndex}`,
-      chunkId: `${chapterId}:${chunkIndex}:h${chunkIndex + 1}`
+      chunkId: `${chapterId}:${chunkIndex}:h${chunkIndex + 1}`,
+      paragraphId: `p-${chunkIndex}`,
+      paragraphIds: [`p-${chunkIndex}`]
     };
   }
 
@@ -188,6 +202,221 @@ test("play on a warmed session starts the live stream path", async () => {
   assert.equal(state.chapterId, "chapter-play");
   assert.equal(state.playRequested, true);
   assert.deepEqual(queue.startedStreams, ["chapter-play"]);
+});
+
+test("active chunk start scrolls and highlights the page chunk", async () => {
+  const queue = new TestPlaybackQueue();
+  queue.tabsApi.sendMessage = async (tabId, message) => {
+    queue.tabMessages.push({ tabId, message });
+    return { ok: true };
+  };
+
+  await queue.saveSession({
+    chapterId: "chapter-scroll",
+    storyId: "story-scroll",
+    title: "Scroll Chapter",
+    partId: "chapter-scroll",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    tabId: 99,
+    state: "playback_starting",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "starting",
+    currentChunkIndex: 0,
+    currentChunkId: "chapter-scroll:0:h1",
+    totalChunks: 3,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: false,
+    playbackAttemptId: "chapter-scroll:attempt:1",
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "playback_dispatch_requested",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: null,
+    text: "Scroll text",
+    paragraphs: [{ text: "Scroll text", paragraphId: "p-0" }],
+    transportMode: "live_stream",
+    streamStatus: "connecting",
+    bytesReceived: 0,
+    bufferedAudioMs: 0,
+    firstByteAt: null,
+    firstAudioAt: null,
+    stallCount: 0
+  });
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-scroll",
+    chunkId: "chapter-scroll:0:h1",
+    attemptId: "chapter-scroll:attempt:1"
+  });
+
+  assert.equal(queue.tabMessages[0].tabId, 99);
+  assert.equal(queue.tabMessages[0].message.type, "READALOUD_SET_ACTIVE_CHUNK");
+  assert.deepEqual(queue.tabMessages[0].message.payload.paragraphIds, ["p-0"]);
+  assert.equal(queue.tabMessages[0].message.payload.clearPrevious, true);
+});
+
+test("active chunk start falls back to the active tab when the session has no tab id", async () => {
+  const queue = new TestPlaybackQueue({
+    queriedTabs: [{ id: 77 }]
+  });
+
+  await queue.saveSession({
+    chapterId: "chapter-tab-fallback",
+    storyId: "story-tab-fallback",
+    title: "Fallback Chapter",
+    partId: "chapter-tab-fallback",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    tabId: null,
+    state: "playback_starting",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "starting",
+    currentChunkIndex: 0,
+    currentChunkId: "chapter-tab-fallback:0:h1",
+    totalChunks: 3,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: false,
+    playbackAttemptId: "chapter-tab-fallback:attempt:1",
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "playback_dispatch_requested",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: null,
+    text: "Tab fallback text",
+    paragraphs: [{ text: "Tab fallback text", paragraphId: "p-0" }],
+    transportMode: "live_stream",
+    streamStatus: "connecting",
+    bytesReceived: 0,
+    bufferedAudioMs: 0,
+    firstByteAt: null,
+    firstAudioAt: null,
+    stallCount: 0
+  });
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-tab-fallback",
+    chunkId: "chapter-tab-fallback:0:h1",
+    attemptId: "chapter-tab-fallback:attempt:1"
+  });
+
+  assert.equal(queue.tabMessages[0].tabId, 77);
+});
+
+test("stop clears the active chunk highlight on the page", async () => {
+  const queue = new TestPlaybackQueue();
+  queue.tabsApi.sendMessage = async (tabId, message) => {
+    queue.tabMessages.push({ tabId, message });
+    return { ok: true };
+  };
+
+  await queue.saveSession({
+    chapterId: "chapter-stop",
+    storyId: "story-stop",
+    title: "Stop Chapter",
+    partId: "chapter-stop",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    tabId: 101,
+    state: "awaiting_chunk_end",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "playing",
+    currentChunkIndex: 0,
+    currentChunkId: "chapter-stop:0:h1",
+    totalChunks: 3,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: true,
+    playbackAttemptId: "chapter-stop:attempt:1",
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "playback_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: null,
+    text: "Stop text",
+    paragraphs: [{ text: "Stop text", paragraphId: "p-0" }],
+    transportMode: "live_stream",
+    streamStatus: "playing",
+    bytesReceived: 1000,
+    bufferedAudioMs: 300,
+    firstByteAt: 1,
+    firstAudioAt: 2,
+    stallCount: 0
+  });
+
+  await queue.stop("chapter-stop");
+
+  assert.equal(queue.tabMessages.at(-1).message.type, "READALOUD_CLEAR_ACTIVE_CHUNK");
+});
+
+test("prepared lookahead chunks do not trigger page focus changes", async () => {
+  const queue = new TestPlaybackQueue();
+
+  await queue.saveSession({
+    chapterId: "chapter-prewarm",
+    storyId: "story-prewarm",
+    title: "Prewarm Chapter",
+    partId: "chapter-prewarm",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    tabId: 77,
+    state: "awaiting_chunk_end",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "playing",
+    currentChunkIndex: 0,
+    currentChunkId: "chapter-prewarm:0:h1",
+    totalChunks: 3,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: true,
+    playbackAttemptId: "chapter-prewarm:attempt:1",
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "playback_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: null,
+    text: "Prewarm text",
+    paragraphs: [{ text: "Prewarm text", paragraphId: "p-0" }],
+    transportMode: "live_stream",
+    streamStatus: "playing",
+    bytesReceived: 1000,
+    bufferedAudioMs: 300,
+    firstByteAt: 1,
+    firstAudioAt: 2,
+    stallCount: 0
+  });
+
+  await queue.handleRuntimeMessage({
+    type: "STREAM_PREPARE_READY",
+    chapterId: "chapter-prewarm",
+    chunkId: "chapter-prewarm:1:h2"
+  });
+
+  assert.equal(queue.tabMessages.length, 0);
 });
 
 test("chunk start prefetches the next chunk", async () => {

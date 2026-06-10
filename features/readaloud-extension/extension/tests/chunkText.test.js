@@ -31,3 +31,24 @@ test("should_generate_stable_hash_for_identical_values", () => {
   assert.equal(stableHash("same"), stableHash("same"));
   assert.notEqual(stableHash("same"), stableHash("different"));
 });
+
+test("should_preserve_paragraph_anchors_when_source_paragraphs_are_provided", () => {
+  const chunks = chunkText("ignored", {
+    storyId: "story",
+    chapterId: "chapter",
+    paragraphs: [
+      { text: "First chunk paragraph", paragraphId: "p-1" },
+      { text: "Second chunk paragraph", paragraphId: "p-2" }
+    ]
+  });
+
+  assert.equal(chunks.length, 2);
+  assert.deepEqual(
+    chunks.map((chunk) => chunk.paragraphId),
+    ["p-1", "p-2"]
+  );
+  assert.deepEqual(
+    chunks.map((chunk) => chunk.paragraphIds),
+    [["p-1"], ["p-2"]]
+  );
+});

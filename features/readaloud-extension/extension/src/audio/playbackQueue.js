@@ -44,9 +44,14 @@ const PLAYBACK_RUNTIME_EVENTS = new Set([
 ]);
 
 export class PlaybackQueue {
-  constructor(runtimeApi = chrome.runtime, storageArea = chrome.storage.local) {
+  constructor(
+    runtimeApi = globalThis.chrome?.runtime,
+    storageArea = globalThis.chrome?.storage?.local,
+    tabsApi = globalThis.chrome?.tabs
+  ) {
     this.runtimeApi = runtimeApi;
     this.storageArea = storageArea;
+    this.tabsApi = tabsApi;
     this.runtimeApi.onMessage.addListener((message) => {
       if (!PLAYBACK_RUNTIME_EVENTS.has(message?.type)) {
         return undefined;
@@ -116,6 +121,79 @@ export class PlaybackQueue {
 
   async getChunkRecord(chapterId, chunkIndex) {
     return getChunkByIndex(chapterId, chunkIndex);
+  }
+
+  async sendPageCommand(tabId, message) {
+    if (!this.tabsApi?.sendMessage || typeof tabId !== "number") {
+      return { ok: false, error: "page_command_unavailable" };
+    }
+
+    try {
+      return await this.tabsApi.sendMessage(tabId, {
+        scope: "readaloud",
+        ...message
+      });
+    } catch (error) {
+      return { ok: false, error: String(error) };
+    }
+  }
+
+  async resolvePageTabId(session) {
+    if (typeof session?.tabId === "number") {
+      return session.tabId;
+    }
+
+    if (typeof this.tabsApi?.query !== "function") {
+      return null;
+    }
+
+    try {
+      const tabs = await this.tabsApi.query({
+        active: true,
+        currentWindow: true
+      });
+      return tabs[0]?.id ?? null;
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  async focusChunkOnPage(session, chunkId, { clearPrevious = true } = {}) {
+    const tabId = await this.resolvePageTabId(session);
+    if (typeof tabId !== "number" || !chunkId) {
+      return { ok: false, error: "missing_page_target" };
+    }
+
+    const chunk = await this.getChunkRecord(session.chapterId, session.currentChunkIndex);
+    if (!chunk || chunk.chunkId !== chunkId) {
+      return { ok: false, error: "chunk_not_found" };
+    }
+
+    return this.sendPageCommand(tabId, {
+      type: "READALOUD_SET_ACTIVE_CHUNK",
+      payload: {
+        chapterId: session.chapterId,
+        chunkId: chunk.chunkId,
+        paragraphIds: chunk.paragraphIds || (chunk.paragraphId ? [chunk.paragraphId] : []),
+        scroll: true,
+        highlight: true,
+        clearPrevious
+      }
+    });
+  }
+
+  async clearChunkFocus(session) {
+    const tabId = await this.resolvePageTabId(session);
+    if (typeof tabId !== "number") {
+      return { ok: false, error: "missing_page_target" };
+    }
+
+    return this.sendPageCommand(tabId, {
+      type: "READALOUD_CLEAR_ACTIVE_CHUNK",
+      payload: {
+        chapterId: session.chapterId
+      }
+    });
   }
 
   async cleanupExpiredAudioRecords() {
@@ -294,7 +372,9 @@ export class PlaybackQueue {
       storyId: playbackInput.storyId || DEFAULT_STORY_ID,
       voice: playbackInput.voice || DEFAULT_VOICE,
       providerMode: playbackInput.providerMode || DEFAULT_PROVIDER_MODE,
+      tabId: playbackInput.tabId || null,
       text: playbackInput.text,
+      paragraphs: playbackInput.paragraphs || [],
       title: playbackInput.title || "Wattpad Chapter",
       sourceUrl: playbackInput.sourceUrl || "",
       partId: playbackInput.partId || chapterId,
@@ -386,11 +466,13 @@ export class PlaybackQueue {
     if (existingSession?.text && existingSession.state !== "error") {
       const resumedWarmSession = existingSession.stopped || existingSession.state === "ended"
         ? this.createRestartedSession(existingSession, {
+            tabId: options.tabId || existingSession.tabId || null,
             playRequested: true,
             lastEvent: "play_requested_after_stop"
           })
         : {
             ...existingSession,
+            tabId: options.tabId || existingSession.tabId || null,
             paused: false,
             stopped: false,
             playRequested: true,
@@ -438,12 +520,14 @@ export class PlaybackQueue {
     if (existingSession && existingSession.text === playbackInput.text && existingSession.state !== "error") {
       const resumedWarmSession = existingSession.stopped || existingSession.state === "ended"
         ? this.createRestartedSession(existingSession, {
+            tabId: playbackInput.tabId || existingSession.tabId || null,
             playRequested: false,
             state: "startup_ready",
             lastEvent: "session_warmup_resumed"
           })
         : {
             ...existingSession,
+            tabId: playbackInput.tabId || existingSession.tabId || null,
             paused: false,
             stopped: false,
             playRequested: false,
@@ -504,6 +588,7 @@ export class PlaybackQueue {
         lastEvent: "session_stopped"
       };
       await this.saveSession(stoppedSession);
+      await this.clearChunkFocus(stoppedSession).catch(() => {});
     }
     await this.runtimeApi.sendMessage({ type: "STOP_PLAYBACK" });
     return this.getState(resolvedChapterId);
@@ -514,7 +599,8 @@ export class PlaybackQueue {
     const chapter = await getChapter(session.chapterId);
     const chunks = chunkText(session.text, {
       storyId: session.storyId,
-      chapterId: session.chapterId
+      chapterId: session.chapterId,
+      paragraphs: session.paragraphs || []
     });
     session.totalChunks = chunks.length;
 
@@ -536,6 +622,10 @@ export class PlaybackQueue {
     if (!existing.length) {
       await replaceChapterData(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
     } else {
+      if (session.paragraphs?.length && !existing[0]?.paragraphIds?.length) {
+        await replaceChapterData(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
+        return;
+      }
       session.totalChunks = existing.length;
     }
   }
@@ -714,6 +804,7 @@ export class PlaybackQueue {
         firstAudioAt: message.firstAudioAt || session.firstAudioAt || Date.now()
       };
       await this.saveSession(startedSession);
+      await this.focusChunkOnPage(startedSession, message.chunkId, { clearPrevious: true }).catch(() => {});
       await this.prefetchChunkAtOffset(chapterId, startedSession, 1);
       return;
     }
@@ -729,6 +820,9 @@ export class PlaybackQueue {
         bytesReceived: 0,
         bufferedAudioMs: 0
       });
+      if (result.session.state === "ended") {
+        await this.clearChunkFocus(result.session).catch(() => {});
+      }
       if (result.session.state !== "ended") {
         await this.processSession(chapterId);
       }
@@ -746,6 +840,9 @@ export class PlaybackQueue {
         ...result.session,
         streamStatus: result.retryScheduled ? "idle" : "error"
       });
+      if (!result.retryScheduled) {
+        await this.clearChunkFocus(result.session).catch(() => {});
+      }
       if (result.retryScheduled) {
         await this.processSession(chapterId);
       }
@@ -763,6 +860,9 @@ export class PlaybackQueue {
         ...result.session,
         streamStatus: result.retryScheduled ? "idle" : "error"
       });
+      if (!result.retryScheduled) {
+        await this.clearChunkFocus(result.session).catch(() => {});
+      }
       if (result.retryScheduled) {
         await this.processSession(chapterId);
       }
@@ -806,9 +906,11 @@ export class PlaybackQueue {
         voice: options.voice || DEFAULT_VOICE,
         providerMode: options.providerMode || DEFAULT_PROVIDER_MODE,
         text: options.text,
+        paragraphs: options.paragraphs || [],
         title: options.title || "Wattpad Chapter",
         sourceUrl: options.sourceUrl || "",
         partId: options.partId || options.chapterId || DEFAULT_CHAPTER_ID,
+        tabId: options.tabId || null,
         pageDetected: options.pageDetected ?? true,
         pageEligible: options.pageEligible ?? true,
         autoplayAllowed: options.autoplayAllowed ?? false,
@@ -825,9 +927,11 @@ export class PlaybackQueue {
         voice: options.voice || DEFAULT_VOICE,
         providerMode: options.providerMode || DEFAULT_PROVIDER_MODE,
         text: options.text,
+        paragraphs: [],
         title: options.title || "Manual text",
         sourceUrl: options.sourceUrl || "",
         partId: options.partId || options.chapterId || DEFAULT_CHAPTER_ID,
+        tabId: options.tabId || null,
         pageDetected: true,
         pageEligible: true,
         autoplayAllowed: false,
@@ -893,9 +997,11 @@ export class PlaybackQueue {
       voice: options.voice || DEFAULT_VOICE,
       providerMode: options.providerMode || DEFAULT_PROVIDER_MODE,
       text: extraction.text,
+      paragraphs: extraction.paragraphs || [],
       title: extraction.title || "Wattpad Chapter",
       sourceUrl: extraction.sourceUrl || "",
       partId: extraction.partId || chapterId,
+      tabId,
       extractionStrategy: extraction.strategy || "dom-paragraphs",
       extractionConfidence: extraction.confidence || "medium"
     };
@@ -908,7 +1014,9 @@ export class PlaybackQueue {
       storyId: input.storyId || DEFAULT_STORY_ID,
       voice: DEFAULT_VOICE,
       providerMode: DEFAULT_PROVIDER_MODE,
+      tabId: input.tabId || null,
       text: "",
+      paragraphs: [],
       title: input.title || "Wattpad extraction failed",
       sourceUrl: "",
       partId: input.partId || null,
