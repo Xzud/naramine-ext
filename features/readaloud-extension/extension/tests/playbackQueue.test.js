@@ -1188,6 +1188,221 @@ test("near-end playback refreshes lazy-loaded chunks without dropping the active
   );
 });
 
+test("near-end playback resumes after a delayed refresh extends the chapter", async () => {
+  const initial = buildParagraphChapter(19, {
+    chapterId: "chapter-lazy-race",
+    storyId: "story-lazy-race",
+    title: "Lazy Race Chapter"
+  });
+  const refreshed = buildParagraphChapter(22, {
+    chapterId: "chapter-lazy-race",
+    storyId: "story-lazy-race",
+    title: "Lazy Race Chapter"
+  });
+  let resolveExtract;
+  const refreshPromise = new Promise((resolve) => {
+    resolveExtract = resolve;
+  });
+  const queue = new LazyLoadPlaybackQueue({
+    chunkStore: initial.chunks.map((chunk) => ({
+      ...chunk,
+      status: "pending"
+    })),
+    chapterRecord: initial.chapter
+  });
+  queue.tabsApi.sendMessage = async (tabId, message) => {
+    queue.tabMessages.push({ tabId, message });
+
+    if (message.type === "READALOUD_EXTRACT_TEXT") {
+      return refreshPromise;
+    }
+
+    return { ok: true };
+  };
+
+  await queue.saveSession({
+    chapterId: "chapter-lazy-race",
+    storyId: "story-lazy-race",
+    title: "Lazy Race Chapter",
+    partId: "chapter-lazy-race",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    tabId: 222,
+    state: "awaiting_chunk_end",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "playing",
+    currentChunkIndex: 18,
+    currentChunkId: initial.chunks[18].chunkId,
+    totalChunks: initial.chunks.length,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: true,
+    playbackAttemptId: "chapter-lazy-race:attempt:1",
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "playback_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: "chapter-lazy-race:17:h18",
+    text: initial.text,
+    paragraphs: initial.paragraphs,
+    transportMode: "live_stream",
+    streamStatus: "playing",
+    bytesReceived: 1024,
+    bufferedAudioMs: 320,
+    firstByteAt: 1,
+    firstAudioAt: 2,
+    stallCount: 0
+  });
+
+  const startedPromise = queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-lazy-race",
+    chunkId: initial.chunks[18].chunkId,
+    attemptId: "chapter-lazy-race:attempt:1"
+  });
+  const endedPromise = queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_ENDED",
+    chapterId: "chapter-lazy-race",
+    chunkId: initial.chunks[18].chunkId,
+    attemptId: "chapter-lazy-race:attempt:1"
+  });
+
+  resolveExtract({
+    ok: true,
+    text: refreshed.text,
+    title: refreshed.chapter.title,
+    sourceUrl: refreshed.chapter.sourceUrl,
+    storyId: refreshed.chapter.storyId,
+    partId: refreshed.chapter.chapterId,
+    strategy: "dom-paragraphs",
+    confidence: "high",
+    paragraphs: refreshed.paragraphs
+  });
+
+  await Promise.all([startedPromise, endedPromise]);
+
+  const session = await queue.loadSession("chapter-lazy-race");
+
+  assert.equal(queue.tabMessages.some((entry) => entry.message.type === "READALOUD_EXTRACT_TEXT"), true);
+  assert.equal(queue.processCalls, 1);
+  assert.deepEqual(queue.startedStreams, ["chapter-lazy-race"]);
+  assert.equal(queue.chunkStore.length, refreshed.chunks.length);
+  assert.equal(session.totalChunks, refreshed.chunks.length);
+  assert.equal(session.currentChunkIndex, 19);
+  assert.equal(session.currentChunkId, null);
+  assert.equal(session.state, "ended");
+});
+
+test("near-end playback ignores a refresh that finds no new content", async () => {
+  const initial = buildParagraphChapter(19, {
+    chapterId: "chapter-lazy-static",
+    storyId: "story-lazy-static",
+    title: "Lazy Static Chapter"
+  });
+  let resolveExtract;
+  const refreshPromise = new Promise((resolve) => {
+    resolveExtract = resolve;
+  });
+  const queue = new LazyLoadPlaybackQueue({
+    chunkStore: initial.chunks.map((chunk) => ({
+      ...chunk,
+      status: "pending"
+    })),
+    chapterRecord: initial.chapter
+  });
+  queue.tabsApi.sendMessage = async (tabId, message) => {
+    queue.tabMessages.push({ tabId, message });
+
+    if (message.type === "READALOUD_EXTRACT_TEXT") {
+      return refreshPromise;
+    }
+
+    return { ok: true };
+  };
+
+  await queue.saveSession({
+    chapterId: "chapter-lazy-static",
+    storyId: "story-lazy-static",
+    title: "Lazy Static Chapter",
+    partId: "chapter-lazy-static",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    tabId: 223,
+    state: "awaiting_chunk_end",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "playing",
+    currentChunkIndex: 18,
+    currentChunkId: initial.chunks[18].chunkId,
+    totalChunks: initial.chunks.length,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: true,
+    playbackAttemptId: "chapter-lazy-static:attempt:1",
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "playback_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: "chapter-lazy-static:17:h18",
+    text: initial.text,
+    paragraphs: initial.paragraphs,
+    transportMode: "live_stream",
+    streamStatus: "playing",
+    bytesReceived: 1024,
+    bufferedAudioMs: 320,
+    firstByteAt: 1,
+    firstAudioAt: 2,
+    stallCount: 0
+  });
+
+  const startedPromise = queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-lazy-static",
+    chunkId: initial.chunks[18].chunkId,
+    attemptId: "chapter-lazy-static:attempt:1"
+  });
+  const endedPromise = queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_ENDED",
+    chapterId: "chapter-lazy-static",
+    chunkId: initial.chunks[18].chunkId,
+    attemptId: "chapter-lazy-static:attempt:1"
+  });
+
+  resolveExtract({
+    ok: true,
+    text: initial.text,
+    title: initial.chapter.title,
+    sourceUrl: initial.chapter.sourceUrl,
+    storyId: initial.chapter.storyId,
+    partId: initial.chapter.chapterId,
+    strategy: "dom-paragraphs",
+    confidence: "high",
+    paragraphs: initial.paragraphs
+  });
+
+  await Promise.all([startedPromise, endedPromise]);
+
+  const session = await queue.loadSession("chapter-lazy-static");
+
+  assert.equal(queue.tabMessages.some((entry) => entry.message.type === "READALOUD_EXTRACT_TEXT"), true);
+  assert.equal(queue.processCalls, 0);
+  assert.equal(queue.startedStreams.length, 0);
+  assert.equal(queue.chunkStore.length, initial.chunks.length);
+  assert.equal(session.totalChunks, initial.chunks.length);
+  assert.equal(session.currentChunkIndex, 19);
+  assert.equal(session.currentChunkId, null);
+  assert.equal(session.state, "ended");
+});
+
 test("clicking a paragraph starts playback from the matching chunk and highlights it", async () => {
   const chapter = buildParagraphChapter(8, {
     chapterId: "chapter-click",

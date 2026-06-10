@@ -324,7 +324,7 @@ export class PlaybackQueue {
     }
   }
 
-  async refreshChapterDataFromPage(session) {
+  async refreshChapterDataFromPage(session, { resumePlayback = false } = {}) {
     if (!session?.tabId || !this.isNearChapterEnd(session)) {
       return false;
     }
@@ -374,6 +374,9 @@ export class PlaybackQueue {
 
     await this.mergeChapterChunkData(refreshedSession, chapter, chunks, existingChunks);
     await this.saveSession(refreshedSession);
+    if (resumePlayback) {
+      await this.processSession(refreshedSession.chapterId);
+    }
     return true;
   }
 
@@ -1118,7 +1121,7 @@ export class PlaybackQueue {
       await this.saveSession(startedSession);
       await this.focusChunkOnPage(startedSession, message.chunkId, { clearPrevious: true }).catch(() => {});
       await this.prefetchChunkAtOffset(chapterId, startedSession, 1);
-      await this.refreshChapterDataFromPage(startedSession).catch(() => {});
+      await this.refreshChapterDataFromPage(startedSession, { resumePlayback: true }).catch(() => {});
       return;
     }
 
