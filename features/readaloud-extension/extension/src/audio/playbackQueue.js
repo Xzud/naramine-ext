@@ -12,6 +12,7 @@ import {
   getChapter,
   getChunkByIndex,
   getChunksByChapter,
+  saveChunks,
   replaceChapterData,
   saveChapter
 } from "../db/idb.js";
@@ -33,6 +34,7 @@ import {
 
 const SESSION_PREFIX = "readaloud:session:";
 const ACTIVE_CHAPTER_KEY = "readaloud:activeChapterId";
+const CHAPTER_REFRESH_LOOKAHEAD = 3;
 const PLAYBACK_RUNTIME_EVENTS = new Set([
   "CHUNK_PLAYBACK_STARTED",
   "CHUNK_PLAYBACK_ENDED",
@@ -123,6 +125,26 @@ export class PlaybackQueue {
     return getChunkByIndex(chapterId, chunkIndex);
   }
 
+  async getChapterRecord(chapterId) {
+    return getChapter(chapterId);
+  }
+
+  async getChapterChunkRecords(chapterId) {
+    return getChunksByChapter(chapterId);
+  }
+
+  async saveChapterRecord(record) {
+    return saveChapter(record);
+  }
+
+  async saveChunkRecords(records) {
+    return saveChunks(records);
+  }
+
+  async replaceChapterChunkRecords(chapterId, chunkRecords) {
+    return replaceChapterData(chapterId, chunkRecords);
+  }
+
   async sendPageCommand(tabId, message) {
     if (!this.tabsApi?.sendMessage || typeof tabId !== "number") {
       return { ok: false, error: "page_command_unavailable" };
@@ -180,6 +202,165 @@ export class PlaybackQueue {
         clearPrevious
       }
     });
+  }
+
+  isNearChapterEnd(session) {
+    if (!session || typeof session.currentChunkIndex !== "number" || typeof session.totalChunks !== "number") {
+      return false;
+    }
+
+    return session.currentChunkIndex >= Math.max(0, session.totalChunks - CHAPTER_REFRESH_LOOKAHEAD);
+  }
+
+  chunkMatchesExistingRecord(existingChunk, nextChunk) {
+    if (!existingChunk || !nextChunk) {
+      return false;
+    }
+
+    if (existingChunk.chunkIndex !== nextChunk.chunkIndex) {
+      return false;
+    }
+
+    if ((existingChunk.text || "") !== (nextChunk.text || "")) {
+      return false;
+    }
+
+    const existingParagraphIds = Array.isArray(existingChunk.paragraphIds)
+      ? existingChunk.paragraphIds.filter(Boolean)
+      : [];
+    const nextParagraphIds = Array.isArray(nextChunk.paragraphIds)
+      ? nextChunk.paragraphIds.filter(Boolean)
+      : [];
+
+    if (!existingParagraphIds.length || !nextParagraphIds.length) {
+      return true;
+    }
+
+    return (
+      existingParagraphIds.length === nextParagraphIds.length &&
+      existingParagraphIds.every((paragraphId, index) => paragraphId === nextParagraphIds[index])
+    );
+  }
+
+  async mergeChapterChunkData(session, chapter, chunks, existingChunks) {
+    const chapterRecord = {
+      chapterId: session.chapterId,
+      storyId: session.storyId,
+      title: session.title || "Wattpad Chapter",
+      sourceUrl: session.sourceUrl || "",
+      textHash: stableHash(session.text),
+      createdAt: chapter?.createdAt || Date.now(),
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000
+    };
+
+    await this.saveChapterRecord(chapterRecord);
+
+    const existingChunkCount = existingChunks.length;
+    const canPreserveExistingChunks =
+      existingChunkCount > 0 &&
+      existingChunkCount <= chunks.length &&
+      existingChunks.every((existingChunk, index) => this.chunkMatchesExistingRecord(existingChunk, chunks[index]));
+
+    if (!canPreserveExistingChunks) {
+      await this.replaceChapterChunkRecords(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
+      return;
+    }
+
+    const upgradedChunks = existingChunks
+      .map((existingChunk, index) => {
+        const nextChunk = chunks[index];
+        if (!nextChunk) {
+          return null;
+        }
+
+        const nextParagraphIds = Array.isArray(nextChunk.paragraphIds) ? nextChunk.paragraphIds.filter(Boolean) : [];
+        const existingParagraphIds = Array.isArray(existingChunk.paragraphIds)
+          ? existingChunk.paragraphIds.filter(Boolean)
+          : [];
+        const shouldUpgradeParagraphAnchors =
+          nextParagraphIds.length > 0 &&
+          (!existingParagraphIds.length ||
+            existingParagraphIds.length !== nextParagraphIds.length ||
+            !existingParagraphIds.every((paragraphId, paragraphIndex) => paragraphId === nextParagraphIds[paragraphIndex]));
+
+        if (!shouldUpgradeParagraphAnchors) {
+          return null;
+        }
+
+        return {
+          ...existingChunk,
+          paragraphId: nextParagraphIds[0] || existingChunk.paragraphId || null,
+          paragraphIds: nextParagraphIds,
+          status: existingChunk.status || "pending"
+        };
+      })
+      .filter(Boolean);
+
+    if (upgradedChunks.length > 0) {
+      await this.saveChunkRecords(upgradedChunks);
+    }
+
+    if (chunks.length > existingChunkCount) {
+      await this.saveChunkRecords(
+        chunks.slice(existingChunkCount).map((chunk) => ({
+          ...chunk,
+          status: "pending"
+        }))
+      );
+    }
+  }
+
+  async refreshChapterDataFromPage(session) {
+    if (!session?.tabId || !this.isNearChapterEnd(session)) {
+      return false;
+    }
+
+    const response = await this.sendPageCommand(session.tabId, {
+      type: "READALOUD_EXTRACT_TEXT"
+    });
+    if (!response?.ok || !response.text) {
+      return false;
+    }
+
+    const latestSession = (await this.loadSession(session.chapterId)) || session;
+    if (latestSession.stopped || latestSession.state === "error") {
+      return false;
+    }
+
+    const latestParagraphCount = Array.isArray(latestSession.paragraphs) ? latestSession.paragraphs.length : 0;
+    const nextParagraphCount = Array.isArray(response.paragraphs) ? response.paragraphs.length : response.paragraphCount || 0;
+    const latestText = latestSession.text || "";
+    const nextText = response.text || "";
+
+    if (nextText.length <= latestText.length && nextParagraphCount <= latestParagraphCount) {
+      return false;
+    }
+
+    const refreshedSession = {
+      ...latestSession,
+      storyId: response.storyId || latestSession.storyId,
+      title: response.title || latestSession.title,
+      sourceUrl: response.sourceUrl || latestSession.sourceUrl,
+      text: nextText,
+      paragraphs: response.paragraphs || latestSession.paragraphs || [],
+      extractionStrategy: response.strategy || latestSession.extractionStrategy,
+      extractionConfidence: response.confidence || latestSession.extractionConfidence,
+      partId: response.partId || latestSession.partId,
+      playRequested: Boolean(latestSession.playRequested)
+    };
+
+    const chapter = await this.getChapterRecord(refreshedSession.chapterId);
+    const chunks = chunkText(refreshedSession.text, {
+      storyId: refreshedSession.storyId,
+      chapterId: refreshedSession.chapterId,
+      paragraphs: refreshedSession.paragraphs || []
+    });
+    refreshedSession.totalChunks = chunks.length;
+    const existingChunks = await this.getChapterChunkRecords(refreshedSession.chapterId);
+
+    await this.mergeChapterChunkData(refreshedSession, chapter, chunks, existingChunks);
+    await this.saveSession(refreshedSession);
+    return true;
   }
 
   async clearChunkFocus(session) {
@@ -599,7 +780,7 @@ export class PlaybackQueue {
 
   async ensureChapterData(session) {
     const chapterHash = stableHash(session.text);
-    const chapter = await getChapter(session.chapterId);
+    const chapter = await this.getChapterRecord(session.chapterId);
     const chunks = chunkText(session.text, {
       storyId: session.storyId,
       chapterId: session.chapterId,
@@ -607,29 +788,64 @@ export class PlaybackQueue {
     });
     session.totalChunks = chunks.length;
 
+    const existing = await this.getChapterChunkRecords(session.chapterId);
+
     if (!chapter || chapter.textHash !== chapterHash) {
-      await saveChapter({
-        chapterId: session.chapterId,
-        storyId: session.storyId,
-        title: session.title || "Wattpad Chapter",
-        sourceUrl: session.sourceUrl || "",
-        textHash: chapterHash,
-        createdAt: Date.now(),
-        expiresAt: Date.now() + 24 * 60 * 60 * 1000
-      });
-      await replaceChapterData(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
+      await this.mergeChapterChunkData(session, chapter, chunks, existing);
       return;
     }
 
-    const existing = await getChunksByChapter(session.chapterId);
     if (!existing.length) {
-      await replaceChapterData(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
+      await this.replaceChapterChunkRecords(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
     } else {
-      if (session.paragraphs?.length && existing.some((chunk) => !chunk.paragraphIds?.length)) {
-        await replaceChapterData(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
+      if (existing.some((chunk, index) => !this.chunkMatchesExistingRecord(chunk, chunks[index]))) {
+        await this.replaceChapterChunkRecords(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
         return;
       }
-      session.totalChunks = existing.length;
+
+      const upgradedChunks = existing
+        .map((existingChunk, index) => {
+          const nextChunk = chunks[index];
+          if (!nextChunk) {
+            return null;
+          }
+
+          const nextParagraphIds = Array.isArray(nextChunk.paragraphIds) ? nextChunk.paragraphIds.filter(Boolean) : [];
+          const existingParagraphIds = Array.isArray(existingChunk.paragraphIds)
+            ? existingChunk.paragraphIds.filter(Boolean)
+            : [];
+          const shouldUpgradeParagraphAnchors =
+            nextParagraphIds.length > 0 &&
+            (!existingParagraphIds.length ||
+              existingParagraphIds.length !== nextParagraphIds.length ||
+              !existingParagraphIds.every((paragraphId, paragraphIndex) => paragraphId === nextParagraphIds[paragraphIndex]));
+
+          if (!shouldUpgradeParagraphAnchors) {
+            return null;
+          }
+
+          return {
+            ...existingChunk,
+            paragraphId: nextParagraphIds[0] || existingChunk.paragraphId || null,
+            paragraphIds: nextParagraphIds,
+            status: existingChunk.status || "pending"
+          };
+        })
+        .filter(Boolean);
+
+      if (upgradedChunks.length > 0) {
+        await this.saveChunkRecords(upgradedChunks);
+      }
+
+      if (existing.length < chunks.length) {
+        await this.saveChunkRecords(
+          chunks.slice(existing.length).map((chunk) => ({
+            ...chunk,
+            status: "pending"
+          }))
+        );
+      }
+      session.totalChunks = chunks.length;
     }
   }
 
@@ -809,6 +1025,7 @@ export class PlaybackQueue {
       await this.saveSession(startedSession);
       await this.focusChunkOnPage(startedSession, message.chunkId, { clearPrevious: true }).catch(() => {});
       await this.prefetchChunkAtOffset(chapterId, startedSession, 1);
+      await this.refreshChapterDataFromPage(startedSession).catch(() => {});
       return;
     }
 

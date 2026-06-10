@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { PlaybackQueue } from "../src/audio/playbackQueue.js";
+import { chunkText, stableHash } from "../src/text/chunkText.js";
 
 class MemoryStorageArea {
   constructor(initial = {}) {
@@ -166,6 +167,94 @@ class LegacyHighlightPlaybackQueue extends TestPlaybackQueue {
       chunkId: record.chunkId || `${chapterId}:${chunkIndex}:legacy-${chunkIndex}`
     };
   }
+}
+
+class LazyLoadPlaybackQueue extends TestPlaybackQueue {
+  constructor(options = {}) {
+    super(options);
+    this.chunkStore = options.chunkStore || [];
+    this.chapterRecord = options.chapterRecord || null;
+  }
+
+  async ensureChapterData(session) {
+    return PlaybackQueue.prototype.ensureChapterData.call(this, session);
+  }
+
+  async getChunkRecord(chapterId, chunkIndex) {
+    const record = this.chunkStore.find(
+      (chunk) => chunk.chapterId === chapterId && chunk.chunkIndex === chunkIndex
+    );
+
+    return record || null;
+  }
+
+  async getChapterRecord(chapterId) {
+    if (this.chapterRecord?.chapterId !== chapterId) {
+      return null;
+    }
+
+    return this.chapterRecord;
+  }
+
+  async getChapterChunkRecords(chapterId) {
+    return this.chunkStore
+      .filter((chunk) => chunk.chapterId === chapterId)
+      .sort((left, right) => left.chunkIndex - right.chunkIndex);
+  }
+
+  async saveChapterRecord(record) {
+    this.chapterRecord = { ...record };
+  }
+
+  async saveChunkRecords(records) {
+    for (const record of records) {
+      const existingIndex = this.chunkStore.findIndex((chunk) => chunk.chunkId === record.chunkId);
+      if (existingIndex >= 0) {
+        this.chunkStore[existingIndex] = {
+          ...this.chunkStore[existingIndex],
+          ...record
+        };
+      } else {
+        this.chunkStore.push({ ...record });
+      }
+    }
+
+    this.chunkStore.sort((left, right) => left.chunkIndex - right.chunkIndex);
+  }
+
+  async replaceChapterChunkRecords(chapterId, chunkRecords) {
+    this.chunkStore = chunkRecords
+      .filter((record) => record.chapterId === chapterId)
+      .map((record) => ({ ...record }));
+  }
+}
+
+function buildParagraphChapter(paragraphCount, { chapterId, storyId, title }) {
+  const paragraphs = Array.from({ length: paragraphCount }, (_value, index) => ({
+    paragraphId: `p-${index}`,
+    text: `Paragraph ${index}`
+  }));
+  const text = paragraphs.map((paragraph) => paragraph.text).join("\n\n");
+  const chunks = chunkText(text, {
+    storyId,
+    chapterId,
+    paragraphs
+  });
+
+  return {
+    paragraphs,
+    text,
+    chapter: {
+      chapterId,
+      storyId,
+      title,
+      sourceUrl: `https://www.wattpad.com/${chapterId}`,
+      textHash: stableHash(text),
+      createdAt: 1,
+      expiresAt: Date.now() + 24 * 60 * 60 * 1000
+    },
+    chunks
+  };
 }
 
 test("queue runtime listener ignores popup messages instead of resolving them with undefined", async () => {
@@ -846,7 +935,7 @@ test("stale chunk error events do not clear the current highlight", async () => 
     playbackStatus: "playing",
     currentChunkIndex: 1,
     currentChunkId: "chapter-stale:1:h2",
-    totalChunks: 3,
+    totalChunks: 5,
     startupReadyAudioCount: 0,
     startupTargetReadyAudioCount: 0,
     startupBufferingComplete: false,
@@ -995,6 +1084,106 @@ test("resuming legacy sessions upgrades chunk anchors before highlighting", asyn
     attemptId: "chapter-legacy:attempt:1"
   });
 
-  assert.ok(queue.tabMessages.length > 0);
-  assert.deepEqual(queue.tabMessages.at(-1).message.payload.paragraphIds, ["p-legacy"]);
+  assert.equal(queue.tabMessages.some((entry) => entry.message.type === "READALOUD_EXTRACT_TEXT"), true);
+  assert.deepEqual(
+    queue.tabMessages.find((entry) => entry.message.type === "READALOUD_SET_ACTIVE_CHUNK")?.message.payload.paragraphIds,
+    ["p-legacy"]
+  );
+});
+
+test("near-end playback refreshes lazy-loaded chunks without dropping the active highlight", async () => {
+  const initial = buildParagraphChapter(19, {
+    chapterId: "chapter-lazy",
+    storyId: "story-lazy",
+    title: "Lazy Chapter"
+  });
+  const refreshed = buildParagraphChapter(22, {
+    chapterId: "chapter-lazy",
+    storyId: "story-lazy",
+    title: "Lazy Chapter"
+  });
+  const queue = new LazyLoadPlaybackQueue({
+    chunkStore: initial.chunks.map((chunk) => ({
+      ...chunk,
+      status: "pending"
+    })),
+    chapterRecord: initial.chapter
+  });
+  queue.tabsApi.sendMessage = async (tabId, message) => {
+    queue.tabMessages.push({ tabId, message });
+
+    if (message.type === "READALOUD_EXTRACT_TEXT") {
+      return {
+        ok: true,
+        text: refreshed.text,
+        title: refreshed.chapter.title,
+        sourceUrl: refreshed.chapter.sourceUrl,
+        storyId: refreshed.chapter.storyId,
+        partId: refreshed.chapter.chapterId,
+        strategy: "dom-paragraphs",
+        confidence: "high",
+        paragraphs: refreshed.paragraphs
+      };
+    }
+
+    return { ok: true };
+  };
+
+  await queue.saveSession({
+    chapterId: "chapter-lazy",
+    storyId: "story-lazy",
+    title: "Lazy Chapter",
+    partId: "chapter-lazy",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    tabId: 222,
+    state: "awaiting_chunk_end",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "playing",
+    currentChunkIndex: 16,
+    currentChunkId: initial.chunks[16].chunkId,
+    totalChunks: initial.chunks.length,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: true,
+    playbackAttemptId: "chapter-lazy:attempt:1",
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "playback_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: "chapter-lazy:15:h15",
+    text: initial.text,
+    paragraphs: initial.paragraphs,
+    transportMode: "live_stream",
+    streamStatus: "playing",
+    bytesReceived: 1024,
+    bufferedAudioMs: 320,
+    firstByteAt: 1,
+    firstAudioAt: 2,
+    stallCount: 0
+  });
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-lazy",
+    chunkId: initial.chunks[16].chunkId,
+    attemptId: "chapter-lazy:attempt:1"
+  });
+
+  const session = await queue.loadSession("chapter-lazy");
+
+  assert.equal(queue.tabMessages.some((entry) => entry.message.type === "READALOUD_EXTRACT_TEXT"), true);
+  assert.equal(queue.chunkStore.length, refreshed.chunks.length);
+  assert.deepEqual(queue.chunkStore.slice(0, initial.chunks.length).map((chunk) => chunk.chunkId), initial.chunks.map((chunk) => chunk.chunkId));
+  assert.equal(session.totalChunks, refreshed.chunks.length);
+  assert.equal(session.currentChunkId, initial.chunks[16].chunkId);
+  assert.deepEqual(
+    queue.tabMessages.find((entry) => entry.message.type === "READALOUD_SET_ACTIVE_CHUNK")?.message.payload.paragraphIds,
+    initial.chunks[16].paragraphIds
+  );
 });
