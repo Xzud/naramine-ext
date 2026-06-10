@@ -115,6 +115,59 @@ class TestPlaybackQueue extends PlaybackQueue {
   }
 }
 
+class LegacyHighlightPlaybackQueue extends TestPlaybackQueue {
+  constructor(options = {}) {
+    super(options);
+    this.ensureCalls = [];
+    this.chunkRecords = options.chunkRecords || [
+      {
+        storyId: "story-legacy",
+        chapterId: "chapter-legacy",
+        chunkIndex: 0,
+        text: "Legacy chunk 0",
+        textHash: "legacy-hash-0",
+        chunkId: "chapter-legacy:0:legacy-0",
+        paragraphId: null,
+        paragraphIds: []
+      }
+    ];
+  }
+
+  async ensureChapterData(session) {
+    this.ensureCalls.push({
+      chapterId: session.chapterId,
+      state: session.state,
+      playRequested: session.playRequested
+    });
+    session.totalChunks = this.chunkRecords.length;
+    const paragraphIds = Array.isArray(session.paragraphs)
+      ? session.paragraphs.map((paragraph) => paragraph.paragraphId).filter(Boolean)
+      : [];
+
+    if (paragraphIds.length) {
+      this.chunkRecords = this.chunkRecords.map((record) => ({
+        ...record,
+        paragraphIds: record.paragraphIds?.length ? record.paragraphIds : [...paragraphIds],
+        paragraphId: record.paragraphIds?.length ? record.paragraphIds[0] : paragraphIds[0] || null
+      }));
+    }
+  }
+
+  async getChunkRecord(chapterId, chunkIndex) {
+    const record = this.chunkRecords[chunkIndex];
+    if (!record) {
+      return null;
+    }
+
+    return {
+      ...record,
+      chapterId,
+      chunkIndex,
+      chunkId: record.chunkId || `${chapterId}:${chunkIndex}:legacy-${chunkIndex}`
+    };
+  }
+}
+
 test("queue runtime listener ignores popup messages instead of resolving them with undefined", async () => {
   const queue = new TestPlaybackQueue();
 
@@ -769,4 +822,179 @@ test("playback errors schedule a bounded retry on the same chapter", async () =>
   assert.equal(session.lastRetryKind, "playback_error");
   assert.equal(session.retryCount, 1);
   assert.deepEqual(queue.startedStreams, ["chapter-retry"]);
+});
+
+test("stale chunk error events do not clear the current highlight", async () => {
+  const queue = new TestPlaybackQueue();
+  queue.tabsApi.sendMessage = async (tabId, message) => {
+    queue.tabMessages.push({ tabId, message });
+    return { ok: true };
+  };
+
+  await queue.saveSession({
+    chapterId: "chapter-stale",
+    storyId: "story-stale",
+    title: "Stale Event Chapter",
+    partId: "chapter-stale",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    tabId: 88,
+    state: "awaiting_chunk_end",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "playing",
+    currentChunkIndex: 1,
+    currentChunkId: "chapter-stale:1:h2",
+    totalChunks: 3,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: true,
+    playbackAttemptId: "chapter-stale:attempt:2",
+    nextPlaybackAttemptSequence: 2,
+    lastEvent: "playback_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: "chapter-stale:0:h1",
+    text: "Stale event text",
+    paragraphs: [{ text: "Stale event text", paragraphId: "p-stale" }],
+    transportMode: "live_stream",
+    streamStatus: "playing",
+    bytesReceived: 1024,
+    bufferedAudioMs: 320,
+    firstByteAt: 1,
+    firstAudioAt: 2,
+    stallCount: 0
+  });
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-stale",
+    chunkId: "chapter-stale:1:h2",
+    attemptId: "chapter-stale:attempt:2"
+  });
+
+  const highlightCount = queue.tabMessages.length;
+  const sessionBefore = await queue.loadSession("chapter-stale");
+
+  for (const type of ["CHUNK_PLAYBACK_ERROR", "CHUNK_PLAYBACK_INTERRUPTED"]) {
+    await queue.handleRuntimeMessage({
+      type,
+      chapterId: "chapter-stale",
+      chunkId: "chapter-stale:0:h1",
+      attemptId: "chapter-stale:attempt:1",
+      error: `late ${type.toLowerCase()}`
+    });
+  }
+
+  const sessionAfter = await queue.loadSession("chapter-stale");
+  assert.equal(sessionAfter.currentChunkId, sessionBefore.currentChunkId);
+  assert.equal(sessionAfter.state, sessionBefore.state);
+  assert.equal(sessionAfter.errorMessage, null);
+  assert.equal(queue.tabMessages.length, highlightCount);
+  assert.equal(queue.tabMessages.at(-1).message.type, "READALOUD_SET_ACTIVE_CHUNK");
+});
+
+test("resuming legacy sessions upgrades chunk anchors before highlighting", async () => {
+  const queue = new LegacyHighlightPlaybackQueue({
+    chunkRecords: [
+      {
+        storyId: "story-legacy",
+        chapterId: "chapter-legacy",
+        chunkIndex: 0,
+        text: "Legacy chunk 0",
+        textHash: "legacy-hash-0",
+        chunkId: "chapter-legacy:0:legacy-0",
+        paragraphId: null,
+        paragraphIds: []
+      }
+    ]
+  });
+  queue.tabsApi.sendMessage = async (tabId, message) => {
+    queue.tabMessages.push({ tabId, message });
+    return { ok: true };
+  };
+
+  await queue.saveSession({
+    chapterId: "chapter-legacy",
+    storyId: "story-legacy",
+    title: "Legacy Chapter",
+    partId: "chapter-legacy",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    tabId: 42,
+    state: "startup_ready",
+    stopped: false,
+    paused: false,
+    playRequested: false,
+    playbackStatus: "idle",
+    currentChunkIndex: 0,
+    currentChunkId: null,
+    totalChunks: 1,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: false,
+    playbackAttemptId: null,
+    nextPlaybackAttemptSequence: 0,
+    lastEvent: "session_warmup_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: null,
+    text: "Legacy chapter text",
+    paragraphs: [{ text: "Legacy chapter text", paragraphId: "p-legacy" }],
+    transportMode: "live_stream",
+    streamStatus: "idle",
+    bytesReceived: 0,
+    bufferedAudioMs: 0,
+    firstByteAt: null,
+    firstAudioAt: null,
+    stallCount: 0
+  });
+
+  await queue.warmup({
+    ok: true,
+    text: "Legacy chapter text",
+    title: "Legacy Chapter",
+    sourceUrl: "https://www.wattpad.com/legacy",
+    storyId: "story-legacy",
+    partId: "chapter-legacy",
+    strategy: "dom-paragraphs",
+    confidence: "high",
+    tabId: 42,
+    paragraphs: [{ text: "Legacy chapter text", paragraphId: "p-legacy" }]
+  });
+
+  await queue.start({
+    ok: true,
+    text: "Legacy chapter text",
+    title: "Legacy Chapter",
+    sourceUrl: "https://www.wattpad.com/legacy",
+    storyId: "story-legacy",
+    partId: "chapter-legacy",
+    strategy: "dom-paragraphs",
+    confidence: "high",
+    tabId: 42,
+    paragraphs: [{ text: "Legacy chapter text", paragraphId: "p-legacy" }]
+  });
+
+  assert.equal(queue.ensureCalls.length, 2);
+  assert.equal(queue.ensureCalls[0].playRequested, false);
+  assert.equal(queue.ensureCalls[1].playRequested, true);
+  assert.deepEqual(queue.chunkRecords[0].paragraphIds, ["p-legacy"]);
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-legacy",
+    chunkId: "chapter-legacy:0:legacy-0",
+    attemptId: "chapter-legacy:attempt:1"
+  });
+
+  assert.ok(queue.tabMessages.length > 0);
+  assert.deepEqual(queue.tabMessages.at(-1).message.payload.paragraphIds, ["p-legacy"]);
 });

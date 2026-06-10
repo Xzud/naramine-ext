@@ -458,6 +458,7 @@ export class PlaybackQueue {
           lastEvent: "session_resumed",
           errorMessage: null
         };
+        await this.ensureChapterData(resumedSession);
         await this.saveSession(resumedSession);
         return this.getState(activeChapterId);
       }
@@ -479,6 +480,7 @@ export class PlaybackQueue {
             state: existingSession.state === "startup_ready" ? "playback_starting" : existingSession.state,
             lastEvent: "play_requested"
           };
+      await this.ensureChapterData(resumedWarmSession);
       await this.saveSession(resumedWarmSession);
       await this.ensureOffscreenDocument();
       await this.processSession(activeChapterId);
@@ -534,6 +536,7 @@ export class PlaybackQueue {
             state: "startup_ready",
             lastEvent: "session_warmup_resumed"
           };
+      await this.ensureChapterData(resumedWarmSession);
       await this.saveSession(resumedWarmSession);
       return this.getState(chapterId);
     }
@@ -622,7 +625,7 @@ export class PlaybackQueue {
     if (!existing.length) {
       await replaceChapterData(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
     } else {
-      if (session.paragraphs?.length && !existing[0]?.paragraphIds?.length) {
+      if (session.paragraphs?.length && existing.some((chunk) => !chunk.paragraphIds?.length)) {
         await replaceChapterData(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
         return;
       }
@@ -830,6 +833,14 @@ export class PlaybackQueue {
     }
 
     if (message.type === "CHUNK_PLAYBACK_INTERRUPTED") {
+      if (session.currentChunkId !== message.chunkId) {
+        return;
+      }
+
+      if (message.attemptId && session.playbackAttemptId && session.playbackAttemptId !== message.attemptId) {
+        return;
+      }
+
       const result = applyPlaybackInterrupted(
         session,
         message.chunkId,
@@ -850,6 +861,14 @@ export class PlaybackQueue {
     }
 
     if (message.type === "CHUNK_PLAYBACK_ERROR") {
+      if (session.currentChunkId !== message.chunkId) {
+        return;
+      }
+
+      if (message.attemptId && session.playbackAttemptId && session.playbackAttemptId !== message.attemptId) {
+        return;
+      }
+
       const result = applyPlaybackError(
         session,
         message.chunkId,

@@ -117,7 +117,7 @@ function createChunkFocusController({
 
     if (scroll && windowRef) {
       const scrollTarget = nodes[0];
-      scrollTarget.scrollIntoView({ block: "center", inline: "nearest" });
+      scrollTarget.scrollIntoView({ block: "start", inline: "nearest" });
     }
 
     return { ok: true };

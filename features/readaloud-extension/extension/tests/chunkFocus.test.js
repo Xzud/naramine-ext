@@ -87,6 +87,7 @@ test("should_scroll_and_highlight_the_active_chunk", () => {
   assert.equal(result.ok, true);
   assert.equal(nodes["p-1"].classList.contains("readaloud-active-chunk"), true);
   assert.equal(nodes["p-1"].scrollCalls, 1);
+  assert.deepEqual(nodes["p-1"].scrollOptions, { block: "start", inline: "nearest" });
 });
 
 test("should_scroll_when_the_chunk_is_already_visible", () => {
@@ -105,6 +106,7 @@ test("should_scroll_when_the_chunk_is_already_visible", () => {
   });
 
   assert.equal(nodes["p-1"].scrollCalls, 1);
+  assert.deepEqual(nodes["p-1"].scrollOptions, { block: "start", inline: "nearest" });
 });
 
 test("should_restore_the_active_highlight_after_dom_mutation", () => {
