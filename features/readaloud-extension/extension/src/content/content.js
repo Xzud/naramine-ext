@@ -55,6 +55,20 @@ function ensureClickableParagraphStyles(documentRef) {
   documentRef.head?.appendChild(style) || documentRef.documentElement?.appendChild(style);
 }
 
+function normalizeWattpadPageHref(href = "") {
+  if (!href) {
+    return "";
+  }
+
+  try {
+    const url = new URL(href, "https://www.wattpad.com");
+    url.pathname = url.pathname.replace(/\/page\/\d+\/?$/i, "");
+    return `${url.origin}${url.pathname}${url.search}${url.hash}`;
+  } catch (_error) {
+    return String(href).replace(/\/page\/\d+\/?($|[?#])/i, "$1");
+  }
+}
+
 function createChunkFocusController({
   documentRef,
   windowRef = globalThis.window,
@@ -508,10 +522,17 @@ function notifyPageReady(documentRef) {
 
 function getPageSignature(documentRef) {
   const article = documentRef.querySelector("article.story-part[data-part-id]");
+  const partId = article?.dataset?.partId || "";
+
+  if (partId) {
+    return JSON.stringify({
+      partId
+    });
+  }
+
   return JSON.stringify({
-    href: documentRef.location?.href || "",
-    title: documentRef.title || "",
-    partId: article?.dataset?.partId || ""
+    href: normalizeWattpadPageHref(documentRef.location?.href || ""),
+    title: documentRef.title || ""
   });
 }
 
