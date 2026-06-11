@@ -41,13 +41,20 @@ function setPlaybackState(overrides = {}) {
 }
 
 function emitRuntimeMessage(type, extra = {}, { chunkId = activeChunkId, attemptId = currentAttemptId } = {}) {
-  chrome.runtime.sendMessage({
-    type,
-    chapterId: currentChapterId,
-    chunkId,
-    attemptId,
-    ...extra
-  });
+  try {
+    const result = chrome.runtime.sendMessage({
+      type,
+      chapterId: currentChapterId,
+      chunkId,
+      attemptId,
+      ...extra
+    });
+    if (result && typeof result.catch === "function") {
+      result.catch(() => {});
+    }
+  } catch (_error) {
+    // The service worker may be restarting; events are re-derived from status polls.
+  }
 }
 
 function syncActivePlayback(slot, status, overrides = {}) {
@@ -109,54 +116,30 @@ function buildRequest(message) {
 function createSlotCallbacks(slot) {
   return {
     onConnected: () => {
-      if (slot.role === "active") {
-        syncActivePlayback(slot, slot.player.getStatus(), { streamStatus: "connecting" });
-        emitRuntimeMessage("STREAM_PLAYBACK_PROGRESS", {
-          streamStatus: playbackState.streamStatus,
-          bytesReceived: playbackState.bytesReceived,
-          bufferedAudioMs: playbackState.bufferedAudioMs,
-          firstByteAt: playbackState.firstByteAt,
-          firstAudioAt: playbackState.firstAudioAt
-        });
+      if (slot.role !== "active") {
         return;
       }
-
-      emitRuntimeMessage(
-        "STREAM_PREPARE_PROGRESS",
-        {
-          streamStatus: slot.player.getStatus().streamStatus,
-          bytesReceived: slot.player.getStatus().bytesReceived,
-          bufferedAudioMs: slot.player.getStatus().bufferedAudioMs,
-          firstByteAt: slot.player.getStatus().firstByteAt,
-          firstAudioAt: slot.player.getStatus().firstAudioAt
-        },
-        { chunkId: slot.chunkId, attemptId: slot.attemptId }
-      );
+      syncActivePlayback(slot, slot.player.getStatus(), { streamStatus: "connecting" });
+      emitRuntimeMessage("STREAM_PLAYBACK_PROGRESS", {
+        streamStatus: playbackState.streamStatus,
+        bytesReceived: playbackState.bytesReceived,
+        bufferedAudioMs: playbackState.bufferedAudioMs,
+        firstByteAt: playbackState.firstByteAt,
+        firstAudioAt: playbackState.firstAudioAt
+      });
     },
     onFirstByte: () => {
-      if (slot.role === "active") {
-        syncActivePlayback(slot, slot.player.getStatus());
-        emitRuntimeMessage("STREAM_PLAYBACK_PROGRESS", {
-          streamStatus: playbackState.streamStatus,
-          bytesReceived: playbackState.bytesReceived,
-          bufferedAudioMs: playbackState.bufferedAudioMs,
-          firstByteAt: playbackState.firstByteAt,
-          firstAudioAt: playbackState.firstAudioAt
-        });
+      if (slot.role !== "active") {
         return;
       }
-
-      emitRuntimeMessage(
-        "STREAM_PREPARE_PROGRESS",
-        {
-          streamStatus: slot.player.getStatus().streamStatus,
-          bytesReceived: slot.player.getStatus().bytesReceived,
-          bufferedAudioMs: slot.player.getStatus().bufferedAudioMs,
-          firstByteAt: slot.player.getStatus().firstByteAt,
-          firstAudioAt: slot.player.getStatus().firstAudioAt
-        },
-        { chunkId: slot.chunkId, attemptId: slot.attemptId }
-      );
+      syncActivePlayback(slot, slot.player.getStatus());
+      emitRuntimeMessage("STREAM_PLAYBACK_PROGRESS", {
+        streamStatus: playbackState.streamStatus,
+        bytesReceived: playbackState.bytesReceived,
+        bufferedAudioMs: playbackState.bufferedAudioMs,
+        firstByteAt: playbackState.firstByteAt,
+        firstAudioAt: playbackState.firstAudioAt
+      });
     },
     onReady: (status) => {
       if (slot.role === "active") {
@@ -197,29 +180,17 @@ function createSlotCallbacks(slot) {
       });
     },
     onProgress: (status) => {
-      if (slot.role === "active") {
-        syncActivePlayback(slot, status);
-        emitRuntimeMessage("STREAM_PLAYBACK_PROGRESS", {
-          streamStatus: playbackState.streamStatus,
-          bytesReceived: playbackState.bytesReceived,
-          bufferedAudioMs: playbackState.bufferedAudioMs,
-          firstByteAt: playbackState.firstByteAt,
-          firstAudioAt: playbackState.firstAudioAt
-        });
+      if (slot.role !== "active") {
         return;
       }
-
-      emitRuntimeMessage(
-        "STREAM_PREPARE_PROGRESS",
-        {
-          streamStatus: status?.streamStatus || "receiving",
-          bytesReceived: status?.bytesReceived || 0,
-          bufferedAudioMs: status?.bufferedAudioMs || 0,
-          firstByteAt: status?.firstByteAt || null,
-          firstAudioAt: status?.firstAudioAt || null
-        },
-        { chunkId: slot.chunkId, attemptId: slot.attemptId }
-      );
+      syncActivePlayback(slot, status);
+      emitRuntimeMessage("STREAM_PLAYBACK_PROGRESS", {
+        streamStatus: playbackState.streamStatus,
+        bytesReceived: playbackState.bytesReceived,
+        bufferedAudioMs: playbackState.bufferedAudioMs,
+        firstByteAt: playbackState.firstByteAt,
+        firstAudioAt: playbackState.firstAudioAt
+      });
     },
     onEnded: async (status) => {
       streamSlots.delete(slot.chunkId);
@@ -347,7 +318,7 @@ async function clearActiveSlot() {
   });
 }
 
-async function createSlot(message, role) {
+function createSlot(message, role) {
   const slot = {
     chunkId: message.chunkId,
     attemptId: message.attemptId || `${message.chunkId}:attempt:unknown`,
@@ -355,13 +326,22 @@ async function createSlot(message, role) {
     role,
     player: null
   };
-  const player = new WavStreamPlayer(createSlotCallbacks(slot), {
+  const callbacks = createSlotCallbacks(slot);
+  const player = new WavStreamPlayer(callbacks, {
     autoStart: role === "active",
     startBufferMs: role === "prepared" ? STREAM_READY_BUFFER_MS : undefined
   });
   slot.player = player;
   streamSlots.set(slot.chunkId, slot);
-  await player.open(buildRequest(message));
+  // Connect without blocking the message response: the queue holds its
+  // session lock while dispatching, so awaiting TTS headers here would delay
+  // pause/stop commands. Connect failures flow through the per-slot error
+  // path instead of rejecting the handler (which would stop all playback).
+  player.open(buildRequest(message)).catch((error) => {
+    if (!player.closed) {
+      void callbacks.onError(error);
+    }
+  });
   return slot;
 }
 
@@ -376,7 +356,7 @@ async function prepareStream(message) {
     };
   }
 
-  await createSlot(message, "prepared");
+  createSlot(message, "prepared");
   return {
     ok: true,
     chunkId: message.chunkId,
@@ -438,7 +418,7 @@ async function startLiveStream(message) {
     await clearActiveSlot();
   }
 
-  const slot = await createSlot(message, "active");
+  const slot = createSlot(message, "active");
   activeChunkId = slot.chunkId;
   currentAttemptId = slot.attemptId;
   currentChapterId = slot.chapterId;

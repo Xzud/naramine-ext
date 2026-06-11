@@ -1,6 +1,23 @@
-const SCRIPT_BUFFER_SIZE = 4096;
 const DEFAULT_START_BUFFER_MS = 180;
-const PROGRESS_EVENT_INTERVAL_MS = 250;
+const PROGRESS_EVENT_INTERVAL_MS = 500;
+const MIN_SCHEDULE_BLOCK_MS = 40;
+const SCHEDULE_EPSILON_S = 0.03;
+
+// One AudioContext shared by every player. AudioBuffers carry their own sample
+// rate, so chunks with different rates resample through the same context and
+// chunk handoffs never pay context construction/teardown.
+let sharedAudioContext = null;
+
+function getSharedAudioContext() {
+  if (!sharedAudioContext || sharedAudioContext.state === "closed") {
+    const AudioContextCtor = globalThis.AudioContext || globalThis.webkitAudioContext;
+    if (!AudioContextCtor) {
+      throw new Error("AudioContext is not available in the offscreen document");
+    }
+    sharedAudioContext = new AudioContextCtor();
+  }
+  return sharedAudioContext;
+}
 
 function concatUint8Arrays(chunks, totalLength) {
   const result = new Uint8Array(totalLength);
@@ -136,7 +153,9 @@ export class WavStreamPlayer {
     this.autoStart = options.autoStart ?? true;
     this.startBufferMs = options.startBufferMs ?? DEFAULT_START_BUFFER_MS;
     this.audioContext = null;
-    this.processor = null;
+    this.gainNode = null;
+    this.scheduledSources = new Set();
+    this.scheduledUntil = 0;
     this.abortController = null;
     this.readerPromise = null;
     this.header = null;
@@ -154,6 +173,8 @@ export class WavStreamPlayer {
     this.lastProgressAt = 0;
     this.streamStatus = "idle";
     this.closed = false;
+    this.finished = false;
+    this.progressTimer = null;
   }
 
   async open(request) {
@@ -190,18 +211,24 @@ export class WavStreamPlayer {
   }
 
   async pause() {
+    if (this.closed) {
+      return;
+    }
     this.paused = true;
     this.streamStatus = "paused";
-    if (this.audioContext) {
-      await this.audioContext.suspend();
+    if (this.audioContext && this.playbackStarted) {
+      await this.audioContext.suspend().catch(() => {});
     }
     this.emitProgress(true);
   }
 
   async resume() {
+    if (this.closed) {
+      return false;
+    }
     this.paused = false;
     if (this.audioContext) {
-      await this.audioContext.resume();
+      await this.audioContext.resume().catch(() => {});
     }
     if (this.playbackStarted) {
       this.streamStatus = "playing";
@@ -209,8 +236,10 @@ export class WavStreamPlayer {
       this.streamStatus = "receiving";
       this.maybeStartPlayback();
     }
+    this.schedulePendingAudio();
     this.emitProgress(true);
-    return this.playbackStarted;
+    this.finishIfDrained();
+    return true;
   }
 
   setAutoStart(autoStart) {
@@ -223,20 +252,34 @@ export class WavStreamPlayer {
   async stop() {
     this.closed = true;
     this.streamStatus = "stopped";
+    this.stopProgressTimer();
     if (this.abortController) {
       this.abortController.abort();
       this.abortController = null;
     }
-    if (this.processor) {
-      this.processor.disconnect();
-      this.processor.onaudioprocess = null;
-      this.processor = null;
+    for (const source of this.scheduledSources) {
+      source.onended = null;
+      try {
+        source.stop();
+      } catch (_error) {
+        // Source may not have started yet.
+      }
+      source.disconnect();
     }
-    if (this.audioContext) {
-      await this.audioContext.close().catch(() => {});
-      this.audioContext = null;
+    this.scheduledSources.clear();
+    if (this.gainNode) {
+      this.gainNode.disconnect();
+      this.gainNode = null;
     }
+    // The AudioContext is shared across players; if this player paused it,
+    // hand it back running so the next chunk starts without a resume dance.
+    if (this.audioContext && this.paused) {
+      await this.audioContext.resume().catch(() => {});
+    }
+    this.audioContext = null;
     this.pcmQueue.clear();
+    this.headerChunks = [];
+    this.headerLength = 0;
   }
 
   getStatus() {
@@ -258,6 +301,9 @@ export class WavStreamPlayer {
         const { value, done } = await reader.read();
         if (done) {
           this.streamEnded = true;
+          this.maybeNotifyReady();
+          this.maybeStartPlayback();
+          this.schedulePendingAudio();
           this.emitProgress(true);
           this.finishIfDrained();
           return;
@@ -277,6 +323,7 @@ export class WavStreamPlayer {
 
         this.appendBytes(value);
         this.maybeStartPlayback();
+        this.schedulePendingAudio();
         this.emitProgress();
       }
     } catch (error) {
@@ -303,7 +350,6 @@ export class WavStreamPlayer {
       const dataBytes = headerBytes.subarray(parsedHeader.dataOffset);
       this.headerChunks = [];
       this.headerLength = 0;
-      this.ensureAudioContext();
       if (dataBytes.length > 0) {
         this.pcmQueue.append(dataBytes);
       }
@@ -315,38 +361,8 @@ export class WavStreamPlayer {
     this.maybeNotifyReady();
   }
 
-  ensureAudioContext() {
-    if (this.audioContext || !this.header) {
-      return;
-    }
-
-    const AudioContextCtor = globalThis.AudioContext || globalThis.webkitAudioContext;
-    if (!AudioContextCtor) {
-      throw new Error("AudioContext is not available in the offscreen document");
-    }
-
-    this.audioContext = new AudioContextCtor({
-      sampleRate: this.header.sampleRate
-    });
-    this.processor = this.audioContext.createScriptProcessor(
-      SCRIPT_BUFFER_SIZE,
-      0,
-      this.header.channels
-    );
-    this.processor.onaudioprocess = (event) => {
-      this.handleAudioProcess(event);
-    };
-  }
-
   maybeStartPlayback() {
-    if (
-      this.playbackStarted ||
-      this.paused ||
-      !this.autoStart ||
-      !this.header ||
-      !this.audioContext ||
-      !this.processor
-    ) {
+    if (this.playbackStarted || this.paused || this.closed || !this.autoStart || !this.header) {
       return;
     }
 
@@ -354,16 +370,21 @@ export class WavStreamPlayer {
       (this.header.sampleRate * this.header.bytesPerFrame * this.startBufferMs) / 1000
     );
 
-    if (this.pcmQueue.length < minStartBytes) {
+    if (this.pcmQueue.length < minStartBytes && !this.streamEnded) {
       this.maybeNotifyReady(minStartBytes);
       return;
     }
 
-    this.processor.connect(this.audioContext.destination);
+    this.audioContext = getSharedAudioContext();
+    this.gainNode = this.audioContext.createGain();
+    this.gainNode.connect(this.audioContext.destination);
     this.audioContext.resume().catch(() => {});
     this.playbackStarted = true;
     this.streamStatus = "playing";
     this.firstAudioAt = Date.now();
+    this.scheduledUntil = this.audioContext.currentTime + SCHEDULE_EPSILON_S;
+    this.schedulePendingAudio();
+    this.startProgressTimer();
     this.callbacks.onStarted?.(this.getStatus());
     this.emitProgress(true);
   }
@@ -379,7 +400,7 @@ export class WavStreamPlayer {
         (this.header.sampleRate * this.header.bytesPerFrame * this.startBufferMs) / 1000
       );
 
-    if (this.pcmQueue.length < thresholdBytes) {
+    if (this.pcmQueue.length < thresholdBytes && !this.streamEnded) {
       return;
     }
 
@@ -390,65 +411,122 @@ export class WavStreamPlayer {
     this.callbacks.onReady?.(this.getStatus());
   }
 
-  handleAudioProcess(event) {
-    if (!this.header) {
+  schedulePendingAudio() {
+    if (!this.playbackStarted || this.paused || this.closed || !this.header || !this.audioContext) {
       return;
     }
 
-    const output = event.outputBuffer;
-    const frameCount = output.length;
-    const bytesNeeded = frameCount * this.header.bytesPerFrame;
-    const pcmBytes = this.pcmQueue.readAligned(bytesNeeded, this.header.bytesPerFrame);
-    const framesRead = Math.floor(pcmBytes.length / this.header.bytesPerFrame);
-
-    for (let channel = 0; channel < output.numberOfChannels; channel += 1) {
-      const channelData = output.getChannelData(channel);
-      channelData.fill(0);
+    const { bytesPerFrame, sampleRate, channels } = this.header;
+    const minBytes = this.streamEnded
+      ? bytesPerFrame
+      : Math.ceil((sampleRate * bytesPerFrame * MIN_SCHEDULE_BLOCK_MS) / 1000);
+    if (this.pcmQueue.length < minBytes) {
+      return;
     }
 
-    if (framesRead > 0) {
-      this.decodeFramesIntoOutput(pcmBytes, framesRead, output);
-      if (this.stalled) {
-        this.stalled = false;
-        this.streamStatus = this.paused ? "paused" : "playing";
+    const pcmBytes = this.pcmQueue.readAligned(this.pcmQueue.length, bytesPerFrame);
+    if (pcmBytes.length === 0) {
+      return;
+    }
+
+    const frameCount = pcmBytes.length / bytesPerFrame;
+    const audioBuffer = this.audioContext.createBuffer(channels, frameCount, sampleRate);
+    this.decodeFramesIntoBuffer(pcmBytes, frameCount, audioBuffer);
+
+    const now = this.audioContext.currentTime;
+    if (this.scheduledUntil < now + 0.01) {
+      this.scheduledUntil = now + SCHEDULE_EPSILON_S;
+    }
+
+    const source = this.audioContext.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(this.gainNode);
+    source.onended = () => {
+      this.scheduledSources.delete(source);
+      source.disconnect();
+      this.updateStallState();
+      this.emitProgress();
+      this.finishIfDrained();
+    };
+    this.scheduledSources.add(source);
+    source.start(this.scheduledUntil);
+    this.scheduledUntil += frameCount / sampleRate;
+
+    if (this.stalled) {
+      this.stalled = false;
+    }
+    if (!this.paused) {
+      this.streamStatus = "playing";
+    }
+  }
+
+  decodeFramesIntoBuffer(pcmBytes, frameCount, audioBuffer) {
+    const { audioFormat, channels, bitsPerSample } = this.header;
+    const sampleCount = frameCount * channels;
+    let samples = null;
+    let scale = 1;
+
+    if (audioFormat === 3 && bitsPerSample === 32) {
+      samples = new Float32Array(pcmBytes.buffer, pcmBytes.byteOffset, sampleCount);
+    } else if (bitsPerSample === 16) {
+      samples = new Int16Array(pcmBytes.buffer, pcmBytes.byteOffset, sampleCount);
+      scale = 1 / 32768;
+    } else if (bitsPerSample === 32) {
+      samples = new Int32Array(pcmBytes.buffer, pcmBytes.byteOffset, sampleCount);
+      scale = 1 / 2147483648;
+    } else if (bitsPerSample === 8) {
+      const channelData = [];
+      for (let channel = 0; channel < channels; channel += 1) {
+        channelData.push(audioBuffer.getChannelData(channel));
       }
-    } else if (!this.streamEnded) {
+      for (let frame = 0; frame < frameCount; frame += 1) {
+        for (let channel = 0; channel < channels; channel += 1) {
+          channelData[channel][frame] = (pcmBytes[frame * channels + channel] - 128) / 128;
+        }
+      }
+      return;
+    } else {
+      throw new Error(`Unsupported PCM depth: ${bitsPerSample}`);
+    }
+
+    for (let channel = 0; channel < channels; channel += 1) {
+      const channelData = audioBuffer.getChannelData(channel);
+      for (let frame = 0; frame < frameCount; frame += 1) {
+        channelData[frame] = samples[frame * channels + channel] * scale;
+      }
+    }
+  }
+
+  updateStallState() {
+    if (!this.playbackStarted || this.paused || this.closed || this.streamEnded) {
+      return;
+    }
+
+    if (this.scheduledSources.size === 0 && this.pcmQueue.length === 0) {
       this.stalled = true;
       this.streamStatus = "buffering";
     }
-
-    this.emitProgress();
-    this.finishIfDrained();
   }
 
-  decodeFramesIntoOutput(pcmBytes, framesRead, output) {
-    if (!this.header) {
+  startProgressTimer() {
+    if (this.progressTimer) {
       return;
     }
-
-    const view = new DataView(pcmBytes.buffer, pcmBytes.byteOffset, pcmBytes.byteLength);
-    const { audioFormat, channels, bitsPerSample, bytesPerSample } = this.header;
-
-    for (let frame = 0; frame < framesRead; frame += 1) {
-      const frameOffset = frame * channels * bytesPerSample;
-      for (let channel = 0; channel < channels; channel += 1) {
-        const sampleOffset = frameOffset + channel * bytesPerSample;
-        let sample = 0;
-
-        if (audioFormat === 3 && bitsPerSample === 32) {
-          sample = view.getFloat32(sampleOffset, true);
-        } else if (bitsPerSample === 16) {
-          sample = view.getInt16(sampleOffset, true) / 32768;
-        } else if (bitsPerSample === 8) {
-          sample = (view.getUint8(sampleOffset) - 128) / 128;
-        } else if (bitsPerSample === 32) {
-          sample = view.getInt32(sampleOffset, true) / 2147483648;
-        } else {
-          throw new Error(`Unsupported PCM depth: ${bitsPerSample}`);
-        }
-
-        output.getChannelData(channel)[frame] = sample;
+    this.progressTimer = setInterval(() => {
+      if (this.closed) {
+        this.stopProgressTimer();
+        return;
       }
+      this.updateStallState();
+      this.emitProgress();
+      this.finishIfDrained();
+    }, PROGRESS_EVENT_INTERVAL_MS);
+  }
+
+  stopProgressTimer() {
+    if (this.progressTimer) {
+      clearInterval(this.progressTimer);
+      this.progressTimer = null;
     }
   }
 
@@ -457,8 +535,12 @@ export class WavStreamPlayer {
       return 0;
     }
 
-    const bufferedFrames = this.pcmQueue.length / this.header.bytesPerFrame;
-    return Math.round((bufferedFrames / this.header.sampleRate) * 1000);
+    const queuedFrames = this.pcmQueue.length / this.header.bytesPerFrame;
+    let bufferedMs = (queuedFrames / this.header.sampleRate) * 1000;
+    if (this.audioContext && this.playbackStarted) {
+      bufferedMs += Math.max(0, (this.scheduledUntil - this.audioContext.currentTime) * 1000);
+    }
+    return Math.round(bufferedMs);
   }
 
   emitProgress(force = false) {
@@ -471,11 +553,19 @@ export class WavStreamPlayer {
   }
 
   finishIfDrained() {
-    if (!this.streamEnded || this.pcmQueue.length > 0 || !this.playbackStarted) {
+    if (this.finished || this.closed || this.paused) {
+      return;
+    }
+    if (!this.streamEnded || !this.playbackStarted) {
+      return;
+    }
+    if (this.pcmQueue.length > 0 || this.scheduledSources.size > 0) {
       return;
     }
 
+    this.finished = true;
     this.streamStatus = "ended";
+    this.stopProgressTimer();
     this.callbacks.onEnded?.(this.getStatus());
     void this.stop();
   }

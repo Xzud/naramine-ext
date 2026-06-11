@@ -54,6 +54,7 @@ export class PlaybackQueue {
     this.runtimeApi = runtimeApi;
     this.storageArea = storageArea;
     this.tabsApi = tabsApi;
+    this.sessionTaskChain = Promise.resolve();
     this.runtimeApi.onMessage.addListener((message) => {
       if (!PLAYBACK_RUNTIME_EVENTS.has(message?.type)) {
         return undefined;
@@ -62,6 +63,19 @@ export class PlaybackQueue {
       void this.handleRuntimeMessage(message);
       return undefined;
     });
+  }
+
+  // Sessions are mutated with read-modify-write cycles that await storage and
+  // messaging in between. Serializing every entry point (user commands and
+  // offscreen events) prevents a pause from being overwritten by an in-flight
+  // progress or playback-started handler that loaded the session before it.
+  runExclusive(task) {
+    const result = this.sessionTaskChain.then(() => task());
+    this.sessionTaskChain = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
   }
 
   log(event, session = {}, extra = {}) {
@@ -324,7 +338,10 @@ export class PlaybackQueue {
     }
   }
 
-  async refreshChapterDataFromPage(session, { resumePlayback = false } = {}) {
+  // The page extract is slow tab I/O, so it must not run while holding the
+  // session lock; only the merge/save step is exclusive. Pass
+  // alreadyExclusive: true when calling from inside a locked section.
+  async refreshChapterDataFromPage(session, { resumePlayback = false, alreadyExclusive = false } = {}) {
     if (!session?.tabId || !this.isNearChapterEnd(session)) {
       return false;
     }
@@ -336,6 +353,11 @@ export class PlaybackQueue {
       return false;
     }
 
+    const apply = () => this.applyChapterRefresh(session, response, { resumePlayback });
+    return alreadyExclusive ? apply() : this.runExclusive(apply);
+  }
+
+  async applyChapterRefresh(session, response, { resumePlayback = false } = {}) {
     const latestSession = (await this.loadSession(session.chapterId)) || session;
     if (latestSession.stopped || latestSession.state === "error") {
       return false;
@@ -381,6 +403,10 @@ export class PlaybackQueue {
   }
 
   async playFromParagraph(options = {}) {
+    return this.runExclusive(() => this.playFromParagraphExclusive(options));
+  }
+
+  async playFromParagraphExclusive(options = {}) {
     const playbackInput = await this.resolvePlaybackInput({
       ...options,
       tabId: typeof options.tabId === "number" ? options.tabId : null
@@ -430,10 +456,13 @@ export class PlaybackQueue {
 
     let targetChunk = await this.findChunkForParagraph(chapterId, clickedParagraphId);
     if (!targetChunk) {
-      await this.refreshChapterDataFromPage({
-        ...preparedSession,
-        tabId: preparedSession.tabId || options.tabId || null
-      }).catch(() => {});
+      await this.refreshChapterDataFromPage(
+        {
+          ...preparedSession,
+          tabId: preparedSession.tabId || options.tabId || null
+        },
+        { alreadyExclusive: true }
+      ).catch(() => {});
       await this.ensureChapterData(preparedSession);
       targetChunk = await this.findChunkForParagraph(chapterId, clickedParagraphId);
     }
@@ -718,20 +747,25 @@ export class PlaybackQueue {
   }
 
   async start(options = {}) {
+    return this.runExclusive(() => this.startExclusive(options));
+  }
+
+  async startExclusive(options = {}) {
     const activeChapterId = await this.resolveChapterId(options.chapterId || null);
     const existingSession = await this.loadSession(activeChapterId);
 
-    if (existingSession?.state === "paused") {
+    if (existingSession?.state === "paused" && !existingSession.stopped) {
       const resumeResponse = await this.resumeOffscreenPlayback();
       if (resumeResponse?.ok && resumeResponse.resumed) {
+        const hasStarted = Boolean(existingSession.hasStartedPlayback);
         const resumedSession = {
           ...existingSession,
           paused: false,
           stopped: false,
           playRequested: true,
-          playbackStatus: "playing",
-          state: "awaiting_chunk_end",
-          streamStatus: "playing",
+          playbackStatus: hasStarted ? "playing" : "starting",
+          state: hasStarted ? "awaiting_chunk_end" : "playback_starting",
+          streamStatus: hasStarted ? "playing" : "receiving",
           lastEvent: "session_resumed",
           errorMessage: null
         };
@@ -742,6 +776,7 @@ export class PlaybackQueue {
     }
 
     if (existingSession?.text && existingSession.state !== "error") {
+      const wasPaused = existingSession.state === "paused";
       const resumedWarmSession = existingSession.stopped || existingSession.state === "ended"
         ? this.createRestartedSession(existingSession, {
             tabId: options.tabId || existingSession.tabId || null,
@@ -754,7 +789,12 @@ export class PlaybackQueue {
             paused: false,
             stopped: false,
             playRequested: true,
-            state: existingSession.state === "startup_ready" ? "playback_starting" : existingSession.state,
+            state:
+              existingSession.state === "startup_ready" || wasPaused
+                ? "playback_starting"
+                : existingSession.state,
+            playbackStatus: wasPaused ? "idle" : existingSession.playbackStatus,
+            streamStatus: wasPaused ? "idle" : existingSession.streamStatus,
             lastEvent: "play_requested"
           };
       await this.ensureChapterData(resumedWarmSession);
@@ -787,6 +827,10 @@ export class PlaybackQueue {
   }
 
   async warmup(options = {}) {
+    return this.runExclusive(() => this.warmupExclusive(options));
+  }
+
+  async warmupExclusive(options = {}) {
     const playbackInput = await this.resolvePlaybackInput(options);
     if (!playbackInput.ok) {
       return this.saveExtractionError(playbackInput);
@@ -833,6 +877,10 @@ export class PlaybackQueue {
   }
 
   async pause(chapterId = null) {
+    return this.runExclusive(() => this.pauseExclusive(chapterId));
+  }
+
+  async pauseExclusive(chapterId = null) {
     const resolvedChapterId = await this.resolveChapterId(chapterId);
     const session = await this.loadSession(resolvedChapterId);
     if (!session) {
@@ -854,6 +902,10 @@ export class PlaybackQueue {
   }
 
   async stop(chapterId = null) {
+    return this.runExclusive(() => this.stopExclusive(chapterId));
+  }
+
+  async stopExclusive(chapterId = null) {
     const resolvedChapterId = await this.resolveChapterId(chapterId);
     const session = await this.loadSession(resolvedChapterId);
     if (session) {
@@ -993,10 +1045,25 @@ export class PlaybackQueue {
 
     const offscreenStatus = await this.queryOffscreenPlaybackStatus();
     const offscreenSlot = this.getPreparedSlotSnapshot(offscreenStatus, chunk.chunkId);
-    if (offscreenSlot?.role === "active" && ["connecting", "buffering", "receiving", "playing", "paused"].includes(offscreenSlot.streamStatus)) {
+    if (offscreenSlot?.role === "active" && (offscreenSlot.streamStatus === "paused" || offscreenSlot.paused)) {
+      const resumeResponse = await this.resumeOffscreenPlayback();
+      if (resumeResponse?.ok && resumeResponse.resumed) {
+        const hasStarted = Boolean(session.hasStartedPlayback);
+        await this.saveSession({
+          ...session,
+          paused: false,
+          playRequested: true,
+          playbackStatus: hasStarted ? "playing" : "starting",
+          state: hasStarted ? "awaiting_chunk_end" : "playback_starting",
+          streamStatus: hasStarted ? "playing" : "receiving",
+          lastEvent: "stream_resumed"
+        });
+        return true;
+      }
+      await this.stopOffscreenPlayback();
+    } else if (offscreenSlot?.role === "active" && ["connecting", "buffering", "receiving", "playing"].includes(offscreenSlot.streamStatus)) {
       return true;
-    }
-    if (offscreenSlot?.role === "active" && offscreenSlot.error) {
+    } else if (offscreenSlot?.role === "active" && offscreenSlot.error) {
       await this.stopOffscreenPlayback();
     }
 
@@ -1073,6 +1140,14 @@ export class PlaybackQueue {
   }
 
   async handleRuntimeMessage(message) {
+    const followUp = await this.runExclusive(() => this.handleRuntimeMessageExclusive(message));
+    if (followUp?.refreshSession) {
+      await this.refreshChapterDataFromPage(followUp.refreshSession, { resumePlayback: true }).catch(() => {});
+    }
+    return followUp;
+  }
+
+  async handleRuntimeMessageExclusive(message) {
     const chapterId = message.chapterId || DEFAULT_CHAPTER_ID;
     const session = await this.loadSession(chapterId);
     if (!session || session.stopped) {
@@ -1080,17 +1155,29 @@ export class PlaybackQueue {
     }
 
     if (message.type === "STREAM_PLAYBACK_PROGRESS") {
-      if (session.currentChunkId !== message.chunkId) {
+      if (session.currentChunkId !== message.chunkId || session.paused) {
+        return;
+      }
+
+      const nextStreamStatus = message.streamStatus || session.streamStatus || "idle";
+      const nextFirstByteAt = message.firstByteAt || session.firstByteAt || null;
+      const nextFirstAudioAt = message.firstAudioAt || session.firstAudioAt || null;
+      const statusChanged = nextStreamStatus !== session.streamStatus;
+      const timestampsChanged =
+        nextFirstByteAt !== (session.firstByteAt || null) || nextFirstAudioAt !== (session.firstAudioAt || null);
+      const bytesDelta = Math.abs((message.bytesReceived || 0) - (session.bytesReceived || 0));
+      const bufferedDelta = Math.abs((message.bufferedAudioMs || 0) - (session.bufferedAudioMs || 0));
+      if (!statusChanged && !timestampsChanged && bytesDelta < 65536 && bufferedDelta < 1000) {
         return;
       }
 
       await this.saveSession({
         ...session,
-        streamStatus: message.streamStatus || session.streamStatus || "idle",
+        streamStatus: nextStreamStatus,
         bytesReceived: message.bytesReceived || 0,
         bufferedAudioMs: message.bufferedAudioMs || 0,
-        firstByteAt: message.firstByteAt || session.firstByteAt || null,
-        firstAudioAt: message.firstAudioAt || session.firstAudioAt || null,
+        firstByteAt: nextFirstByteAt,
+        firstAudioAt: nextFirstAudioAt,
         stallCount:
           message.streamStatus === "buffering" && session.streamStatus !== "buffering"
             ? (session.stallCount || 0) + 1
@@ -1110,6 +1197,18 @@ export class PlaybackQueue {
     }
 
     if (message.type === "CHUNK_PLAYBACK_STARTED") {
+      if (session.paused) {
+        // A pause landed while the start event was in flight; the offscreen
+        // player is already suspended. Record the start without unpausing.
+        await this.saveSession({
+          ...session,
+          hasStartedPlayback: true,
+          firstByteAt: session.firstByteAt || message.firstByteAt || null,
+          firstAudioAt: session.firstAudioAt || message.firstAudioAt || null
+        });
+        return;
+      }
+
       const startedSession = {
         ...markPlaybackStarted(session, message.chunkId, message.attemptId || null),
         streamStatus: "playing",
@@ -1121,8 +1220,7 @@ export class PlaybackQueue {
       await this.saveSession(startedSession);
       await this.focusChunkOnPage(startedSession, message.chunkId, { clearPrevious: true }).catch(() => {});
       await this.prefetchChunkAtOffset(chapterId, startedSession, 1);
-      await this.refreshChapterDataFromPage(startedSession, { resumePlayback: true }).catch(() => {});
-      return;
+      return { refreshSession: startedSession };
     }
 
     if (message.type === "CHUNK_PLAYBACK_ENDED") {

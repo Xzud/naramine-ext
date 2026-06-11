@@ -1492,3 +1492,220 @@ test("clicking an unknown paragraph fails without starting playback", async () =
   assert.equal(state.state, "error");
   assert.match(state.errorMessage, /paragraph_not_found/);
 });
+
+function buildPlayingSession(chapterId, overrides = {}) {
+  return {
+    chapterId,
+    storyId: `story-${chapterId}`,
+    title: "Race Chapter",
+    partId: chapterId,
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    state: "awaiting_chunk_end",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "playing",
+    currentChunkIndex: 0,
+    currentChunkId: `${chapterId}:0:h1`,
+    totalChunks: 3,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: true,
+    playbackAttemptId: `${chapterId}:attempt:1`,
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "playback_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: null,
+    text: "Race text",
+    transportMode: "live_stream",
+    streamStatus: "playing",
+    bytesReceived: 1024,
+    bufferedAudioMs: 400,
+    firstByteAt: 1,
+    firstAudioAt: 2,
+    stallCount: 0,
+    ...overrides
+  };
+}
+
+test("pause is not clobbered by a concurrent stream progress event", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.setActiveChapterId("chapter-race");
+  await queue.saveSession(buildPlayingSession("chapter-race"));
+
+  const progressPromise = queue.handleRuntimeMessage({
+    type: "STREAM_PLAYBACK_PROGRESS",
+    chapterId: "chapter-race",
+    chunkId: "chapter-race:0:h1",
+    streamStatus: "buffering",
+    bytesReceived: 2048,
+    bufferedAudioMs: 100
+  });
+  const pausePromise = queue.pause("chapter-race");
+  await Promise.all([progressPromise, pausePromise]);
+
+  const session = await queue.loadSession("chapter-race");
+  assert.equal(session.paused, true);
+  assert.equal(session.state, "paused");
+  assert.equal(session.playbackStatus, "paused");
+  assert.equal(session.streamStatus, "paused");
+});
+
+test("progress events for a paused session are ignored", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.saveSession(
+    buildPlayingSession("chapter-paused-progress", {
+      state: "paused",
+      paused: true,
+      playRequested: false,
+      playbackStatus: "paused",
+      streamStatus: "paused"
+    })
+  );
+
+  await queue.handleRuntimeMessage({
+    type: "STREAM_PLAYBACK_PROGRESS",
+    chapterId: "chapter-paused-progress",
+    chunkId: "chapter-paused-progress:0:h1",
+    streamStatus: "playing",
+    bytesReceived: 4096,
+    bufferedAudioMs: 600
+  });
+
+  const session = await queue.loadSession("chapter-paused-progress");
+  assert.equal(session.paused, true);
+  assert.equal(session.streamStatus, "paused");
+});
+
+test("redundant progress events skip the session write", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.saveSession(buildPlayingSession("chapter-throttle"));
+
+  let saves = 0;
+  const originalSaveSession = queue.saveSession.bind(queue);
+  queue.saveSession = async (session) => {
+    saves += 1;
+    return originalSaveSession(session);
+  };
+
+  await queue.handleRuntimeMessage({
+    type: "STREAM_PLAYBACK_PROGRESS",
+    chapterId: "chapter-throttle",
+    chunkId: "chapter-throttle:0:h1",
+    streamStatus: "playing",
+    bytesReceived: 1024 + 100,
+    bufferedAudioMs: 450,
+    firstByteAt: 1,
+    firstAudioAt: 2
+  });
+  assert.equal(saves, 0);
+
+  await queue.handleRuntimeMessage({
+    type: "STREAM_PLAYBACK_PROGRESS",
+    chapterId: "chapter-throttle",
+    chunkId: "chapter-throttle:0:h1",
+    streamStatus: "buffering",
+    bytesReceived: 1024 + 200,
+    bufferedAudioMs: 0,
+    firstByteAt: 1,
+    firstAudioAt: 2
+  });
+  assert.equal(saves, 1);
+
+  const session = await queue.loadSession("chapter-throttle");
+  assert.equal(session.streamStatus, "buffering");
+  assert.equal(session.stallCount, 1);
+});
+
+test("a started event arriving after pause does not unpause the session", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.saveSession(
+    buildPlayingSession("chapter-late-start", {
+      state: "paused",
+      paused: true,
+      playRequested: false,
+      playbackStatus: "paused",
+      streamStatus: "paused",
+      hasStartedPlayback: false,
+      firstAudioAt: null
+    })
+  );
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-late-start",
+    chunkId: "chapter-late-start:0:h1",
+    attemptId: "chapter-late-start:attempt:1",
+    firstAudioAt: 99
+  });
+
+  const session = await queue.loadSession("chapter-late-start");
+  assert.equal(session.paused, true);
+  assert.equal(session.state, "paused");
+  assert.equal(session.playbackStatus, "paused");
+  assert.equal(session.hasStartedPlayback, true);
+  assert.equal(session.firstAudioAt, 99);
+});
+
+test("play resumes a paused offscreen stream instead of treating it as in flight", async () => {
+  const queue = new TestPlaybackQueue({
+    runtimeStatus: {
+      playing: false,
+      paused: true,
+      chunkId: "chapter-stuck:0:h1",
+      ended: false,
+      error: null,
+      streamStatus: "paused",
+      bytesReceived: 4096,
+      bufferedSegmentCount: 0,
+      slots: [
+        {
+          chunkId: "chapter-stuck:0:h1",
+          attemptId: "chapter-stuck:attempt:1",
+          chapterId: "chapter-stuck",
+          role: "active",
+          streamStatus: "paused",
+          bytesReceived: 4096,
+          bufferedAudioMs: 700,
+          firstByteAt: 1,
+          firstAudioAt: 2,
+          playbackStarted: true,
+          paused: true,
+          ready: true
+        }
+      ]
+    }
+  });
+  queue.resumeOffscreenPlayback = async () => ({
+    ok: true,
+    resumed: true,
+    chunkId: "chapter-stuck:0:h1"
+  });
+
+  await queue.saveSession(
+    buildPlayingSession("chapter-stuck", {
+      state: "playback_starting",
+      paused: false,
+      playRequested: true,
+      playbackStatus: "idle",
+      streamStatus: "idle"
+    })
+  );
+
+  const result = await PlaybackQueue.prototype.startCurrentChunkStream.call(queue, "chapter-stuck");
+
+  assert.equal(result, true);
+  assert.equal(
+    queue.sentMessages.some((message) => message.type === "START_STREAM_PLAYBACK"),
+    false
+  );
+  const session = await queue.loadSession("chapter-stuck");
+  assert.equal(session.playbackStatus, "playing");
+  assert.equal(session.state, "awaiting_chunk_end");
+  assert.equal(session.streamStatus, "playing");
+});
