@@ -1709,3 +1709,166 @@ test("play resumes a paused offscreen stream instead of treating it as in flight
   assert.equal(session.state, "awaiting_chunk_end");
   assert.equal(session.streamStatus, "playing");
 });
+
+class WarmingPlaybackQueue extends LazyLoadPlaybackQueue {
+  constructor(options = {}) {
+    super(options);
+    this.audioStore = [];
+    this.warmedChunkIds = [];
+    this.failChunkIds = options.failChunkIds || new Set();
+  }
+
+  async getAudioRecordsForChapter(chapterId) {
+    return this.audioStore.filter((record) => record.chapterId === chapterId);
+  }
+
+  async saveAudioRecord(record) {
+    this.audioStore.push({ ...record });
+  }
+
+  async markChunkStatus(chunkId, status) {
+    const record = this.chunkStore.find((chunk) => chunk.chunkId === chunkId);
+    if (record) {
+      record.status = status;
+    }
+  }
+
+  async fetchAudioForChunk(_session, chunk) {
+    this.warmedChunkIds.push(chunk.chunkId);
+    if (this.failChunkIds.has(chunk.chunkId)) {
+      throw new Error("synthesis failed");
+    }
+    return { type: "audio/wav" };
+  }
+}
+
+function buildWarmingFixture(paragraphCount, chapterId, overrides = {}) {
+  const chapter = buildParagraphChapter(paragraphCount, {
+    chapterId,
+    storyId: `story-${chapterId}`,
+    title: "Warming Chapter"
+  });
+  const queue = new WarmingPlaybackQueue({
+    chunkStore: chapter.chunks.map((chunk) => ({ ...chunk, status: "pending" })),
+    chapterRecord: chapter.chapter,
+    ...overrides
+  });
+  return { chapter, queue };
+}
+
+test("warming pipeline buffers every remaining chunk to the audio cache in order", async () => {
+  const { chapter, queue } = buildWarmingFixture(6, "chapter-warm");
+
+  await queue.saveSession(
+    buildPlayingSession("chapter-warm", {
+      currentChunkId: chapter.chunks[0].chunkId,
+      totalChunks: chapter.chunks.length,
+      text: chapter.text
+    })
+  );
+
+  await queue.ensureWarmingPipeline("chapter-warm");
+
+  const expected = chapter.chunks.slice(1).map((chunk) => chunk.chunkId);
+  assert.deepEqual(queue.warmedChunkIds, expected);
+  assert.equal(queue.audioStore.length, chapter.chunks.length - 1);
+  for (const chunk of queue.chunkStore.slice(1)) {
+    assert.equal(chunk.status, "ready");
+  }
+});
+
+test("warming pipeline picks up chunks added after the chapter grows", async () => {
+  const { chapter, queue } = buildWarmingFixture(4, "chapter-warm-grow");
+
+  await queue.saveSession(
+    buildPlayingSession("chapter-warm-grow", {
+      currentChunkId: chapter.chunks[0].chunkId,
+      totalChunks: chapter.chunks.length,
+      text: chapter.text
+    })
+  );
+
+  await queue.ensureWarmingPipeline("chapter-warm-grow");
+  assert.equal(queue.audioStore.length, chapter.chunks.length - 1);
+
+  const grown = buildParagraphChapter(7, {
+    chapterId: "chapter-warm-grow",
+    storyId: "story-chapter-warm-grow",
+    title: "Warming Chapter"
+  });
+  await queue.saveChunkRecords(
+    grown.chunks.slice(chapter.chunks.length).map((chunk) => ({ ...chunk, status: "pending" }))
+  );
+
+  await queue.ensureWarmingPipeline("chapter-warm-grow");
+
+  assert.equal(queue.audioStore.length, grown.chunks.length - 1);
+  assert.deepEqual(
+    queue.warmedChunkIds.slice(chapter.chunks.length - 1),
+    grown.chunks.slice(chapter.chunks.length).map((chunk) => chunk.chunkId)
+  );
+});
+
+test("warming pipeline marks failed chunks and keeps going", async () => {
+  const { chapter, queue } = buildWarmingFixture(5, "chapter-warm-fail");
+  queue.failChunkIds = new Set([chapter.chunks[2].chunkId]);
+
+  await queue.saveSession(
+    buildPlayingSession("chapter-warm-fail", {
+      currentChunkId: chapter.chunks[0].chunkId,
+      totalChunks: chapter.chunks.length,
+      text: chapter.text
+    })
+  );
+
+  await queue.ensureWarmingPipeline("chapter-warm-fail");
+
+  assert.equal(queue.chunkStore[2].status, "failed");
+  assert.equal(
+    queue.audioStore.some((record) => record.chunkId === chapter.chunks[2].chunkId),
+    false
+  );
+  assert.equal(queue.audioStore.length, chapter.chunks.length - 2);
+  assert.equal(queue.chunkStore[3].status, "ready");
+  assert.equal(queue.chunkStore[4].status, "ready");
+});
+
+test("warming pipeline does not run for stopped sessions", async () => {
+  const { chapter, queue } = buildWarmingFixture(4, "chapter-warm-stopped");
+
+  await queue.saveSession(
+    buildPlayingSession("chapter-warm-stopped", {
+      stopped: true,
+      state: "ended",
+      playRequested: false,
+      totalChunks: chapter.chunks.length,
+      text: chapter.text
+    })
+  );
+
+  await queue.ensureWarmingPipeline("chapter-warm-stopped");
+
+  assert.deepEqual(queue.warmedChunkIds, []);
+  assert.equal(queue.audioStore.length, 0);
+});
+
+test("warming pipeline is single-flight per chapter", async () => {
+  const { chapter, queue } = buildWarmingFixture(5, "chapter-warm-once");
+
+  await queue.saveSession(
+    buildPlayingSession("chapter-warm-once", {
+      currentChunkId: chapter.chunks[0].chunkId,
+      totalChunks: chapter.chunks.length,
+      text: chapter.text
+    })
+  );
+
+  await Promise.all([
+    queue.ensureWarmingPipeline("chapter-warm-once"),
+    queue.ensureWarmingPipeline("chapter-warm-once"),
+    queue.ensureWarmingPipeline("chapter-warm-once")
+  ]);
+
+  const expected = chapter.chunks.slice(1).map((chunk) => chunk.chunkId);
+  assert.deepEqual(queue.warmedChunkIds, expected);
+});

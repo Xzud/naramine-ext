@@ -1,4 +1,5 @@
 import { DEFAULT_CHAPTER_ID, STREAM_READY_BUFFER_MS } from "../shared/constants.js";
+import { getAudioChunk } from "../db/idb.js";
 import { LocalKokoroProvider } from "../tts/LocalKokoroProvider.js";
 import { ModalKokoroProvider } from "../tts/ModalKokoroProvider.js";
 import { WavStreamPlayer } from "./wavStreamPlayer.js";
@@ -113,6 +114,34 @@ function buildRequest(message) {
   });
 }
 
+async function loadCachedAudio(chunkId) {
+  try {
+    const record = await getAudioChunk(chunkId);
+    return record?.blob ? record : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function releaseSlotResources(slot) {
+  if (slot?.objectUrl) {
+    URL.revokeObjectURL(slot.objectUrl);
+    slot.objectUrl = null;
+  }
+}
+
+// Warm chunks play from the IndexedDB cache through the same streaming code
+// path (a blob object URL streams via fetch); only uncached chunks hit the
+// TTS endpoint live.
+async function resolveStreamRequest(message, slot, cachedAudio = null) {
+  const cached = cachedAudio || (await loadCachedAudio(message.chunkId));
+  if (cached?.blob) {
+    slot.objectUrl = URL.createObjectURL(cached.blob);
+    return { url: slot.objectUrl, method: "GET", headers: {} };
+  }
+  return buildRequest(message);
+}
+
 function createSlotCallbacks(slot) {
   return {
     onConnected: () => {
@@ -194,6 +223,7 @@ function createSlotCallbacks(slot) {
     },
     onEnded: async (status) => {
       streamSlots.delete(slot.chunkId);
+      releaseSlotResources(slot);
 
       if (slot.role !== "active") {
         emitRuntimeMessage(
@@ -229,6 +259,7 @@ function createSlotCallbacks(slot) {
     },
     onError: async (error) => {
       streamSlots.delete(slot.chunkId);
+      releaseSlotResources(slot);
 
       if (slot.role !== "active") {
         emitRuntimeMessage(
@@ -261,6 +292,7 @@ async function stopSlot(slot) {
   }
 
   await slot.player.stop();
+  releaseSlotResources(slot);
   streamSlots.delete(slot.chunkId);
 }
 
@@ -286,6 +318,7 @@ async function stopAllSlots() {
 
   for (const slot of slots) {
     await slot.player.stop().catch(() => {});
+    releaseSlotResources(slot);
   }
 }
 
@@ -318,13 +351,14 @@ async function clearActiveSlot() {
   });
 }
 
-function createSlot(message, role) {
+function createSlot(message, role, cachedAudio = null) {
   const slot = {
     chunkId: message.chunkId,
     attemptId: message.attemptId || `${message.chunkId}:attempt:unknown`,
     chapterId: message.chapterId || DEFAULT_CHAPTER_ID,
     role,
-    player: null
+    player: null,
+    objectUrl: null
   };
   const callbacks = createSlotCallbacks(slot);
   const player = new WavStreamPlayer(callbacks, {
@@ -337,7 +371,10 @@ function createSlot(message, role) {
   // session lock while dispatching, so awaiting TTS headers here would delay
   // pause/stop commands. Connect failures flow through the per-slot error
   // path instead of rejecting the handler (which would stop all playback).
-  player.open(buildRequest(message)).catch((error) => {
+  (async () => {
+    const request = await resolveStreamRequest(message, slot, cachedAudio);
+    await player.open(request);
+  })().catch((error) => {
     if (!player.closed) {
       void callbacks.onError(error);
     }
@@ -356,7 +393,21 @@ async function prepareStream(message) {
     };
   }
 
-  createSlot(message, "prepared");
+  // Prepared slots only load from the warm cache. Streaming lookahead from
+  // the TTS endpoint here would duplicate the warming pipeline's synthesis
+  // of the same chunk; on a cache miss the chunk simply starts as a live
+  // stream (or from cache) when playback reaches it.
+  const cachedAudio = await loadCachedAudio(message.chunkId);
+  if (!cachedAudio) {
+    return {
+      ok: false,
+      error: "not_cached",
+      chunkId: message.chunkId,
+      playback: playbackState
+    };
+  }
+
+  createSlot(message, "prepared", cachedAudio);
   return {
     ok: true,
     chunkId: message.chunkId,

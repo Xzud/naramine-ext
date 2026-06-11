@@ -75,6 +75,14 @@ function getStartupRatio(state) {
   return 0;
 }
 
+function getWarmedRatio(state) {
+  if (!state.stateAvailable || !state.totalChunks) {
+    return 0;
+  }
+
+  return Math.min(state.readyAudioCount || 0, state.totalChunks) / state.totalChunks;
+}
+
 function isPauseable(state) {
   if (!state?.stateAvailable) {
     return false;
@@ -119,6 +127,7 @@ function renderState(state) {
   setText("transport", view.transport);
   setText("intent", view.intent);
   setText("buffer", view.buffer);
+  setText("warmed", view.warmed);
   setText("cache", view.cache);
   setText("source", view.source);
   setText("part", view.part);
@@ -126,6 +135,7 @@ function renderState(state) {
   setText("error", view.error);
   setWidth("chapterMeter", getChapterRatio(state));
   setWidth("startupMeter", getStartupRatio(state));
+  setWidth("warmedMeter", getWarmedRatio(state));
   syncTransportButton(state);
 }
 

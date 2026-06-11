@@ -1,18 +1,22 @@
 services:
+  # Local Kokoro is opt-in now that Modal is the default TTS backend:
+  # docker compose --profile local up --build (with TTS_MODE=local)
   kokoro:
     image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    profiles:
+      - local
     ports:
       - "8880:8880"
 
   backend:
     build:
       context: ./backend
-    depends_on:
-      - kokoro
     environment:
       APP_HOST: 0.0.0.0
       APP_PORT: 3000
-      TTS_MODE: local
+      TTS_MODE: ${TTS_MODE:-modal}
       LOCAL_KOKORO_URL: http://kokoro:8880
+      MODAL_TTS_URL: ${MODAL_TTS_URL:-}
+      MODAL_TTS_TOKEN: ${MODAL_TTS_TOKEN:-}
     ports:
       - "3000:3000"

@@ -122,6 +122,19 @@ function formatTransportStatus(state) {
   return `Transport: ${value}`;
 }
 
+function formatWarmedAudio(state) {
+  if (!state.stateAvailable) {
+    return "Warmed: unavailable";
+  }
+
+  if (!state.totalChunks) {
+    return "Warmed: no chapter loaded";
+  }
+
+  const warmedCount = Math.min(state.readyAudioCount || 0, state.totalChunks);
+  return `Warmed: ${warmedCount} of ${state.totalChunks} chunks`;
+}
+
 function formatIntent(state) {
   if (!state.stateAvailable) {
     return "Intent: unavailable";
@@ -157,6 +170,7 @@ export function buildPopupViewModel(inputState) {
       transport: "Transport: unavailable",
       intent: "Intent: unavailable",
       buffer: "Live stream buffer: unavailable",
+      warmed: "Warmed: unavailable",
       cache: "Cache: unavailable",
       source: "Extraction: unavailable",
       part: "Part ID: unavailable",
@@ -179,6 +193,7 @@ export function buildPopupViewModel(inputState) {
     transport: formatTransportStatus(state),
     intent: formatIntent(state),
     buffer: `Live stream buffer: ${state.bufferedAudioMs || 0} ms, ${state.bytesReceived || 0} bytes`,
+    warmed: formatWarmedAudio(state),
     cache: `Cache: ${state.cacheType}`,
     source: formatConfidence(state.extractionStrategy, state.extractionConfidence),
     part: `Part ID: ${state.partId || "none"}`,

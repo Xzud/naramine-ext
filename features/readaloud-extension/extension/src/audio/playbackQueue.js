@@ -8,13 +8,16 @@ import {
 import { chunkText, stableHash } from "../text/chunkText.js";
 import {
   cleanupExpiredAudio,
+  getAudioChunksByChapter,
   getCacheStatus,
   getChapter,
   getChunkByIndex,
   getChunksByChapter,
+  saveAudioChunk,
   saveChunks,
   replaceChapterData,
-  saveChapter
+  saveChapter,
+  updateChunkStatus
 } from "../db/idb.js";
 import { LocalKokoroProvider } from "../tts/LocalKokoroProvider.js";
 import { ModalKokoroProvider } from "../tts/ModalKokoroProvider.js";
@@ -55,6 +58,7 @@ export class PlaybackQueue {
     this.storageArea = storageArea;
     this.tabsApi = tabsApi;
     this.sessionTaskChain = Promise.resolve();
+    this.activeWarmups = new Map();
     this.runtimeApi.onMessage.addListener((message) => {
       if (!PLAYBACK_RUNTIME_EVENTS.has(message?.type)) {
         return undefined;
@@ -157,6 +161,109 @@ export class PlaybackQueue {
 
   async replaceChapterChunkRecords(chapterId, chunkRecords) {
     return replaceChapterData(chapterId, chunkRecords);
+  }
+
+  async getAudioRecordsForChapter(chapterId) {
+    return getAudioChunksByChapter(chapterId);
+  }
+
+  async saveAudioRecord(record) {
+    return saveAudioChunk(record);
+  }
+
+  async markChunkStatus(chunkId, status) {
+    return updateChunkStatus(chunkId, status);
+  }
+
+  async fetchAudioForChunk(session, chunk) {
+    const provider = this.getProvider(session);
+    const request = provider.createStreamRequest({
+      text: chunk.text,
+      voice: session.voice,
+      format: "wav"
+    });
+    const response = await fetch(request.url, {
+      method: request.method || "POST",
+      headers: request.headers || {},
+      body: request.body
+    });
+    if (!response.ok) {
+      throw new Error(`Warmup synthesis failed: ${response.status}`);
+    }
+    return response.blob();
+  }
+
+  isWarmableSession(session) {
+    return Boolean(session) && Boolean(session.text) && !session.stopped && session.state !== "error";
+  }
+
+  async findNextChunkToWarm(chapterId, fromChunkIndex) {
+    const [chunks, audioRecords] = await Promise.all([
+      this.getChapterChunkRecords(chapterId),
+      this.getAudioRecordsForChapter(chapterId)
+    ]);
+    const cachedChunkIds = new Set(audioRecords.map((record) => record.chunkId));
+    return (
+      chunks.find(
+        (chunk) =>
+          chunk.chunkIndex > fromChunkIndex && !cachedChunkIds.has(chunk.chunkId) && chunk.status !== "failed"
+      ) || null
+    );
+  }
+
+  // Continuously synthesizes chunks ahead of the playhead into the IndexedDB
+  // audio cache, one at a time, until the chapter tail is warm. Single-flight
+  // per chapter; safe to invoke from anywhere because it never writes the
+  // session, so it runs outside the session lock. Re-invoking after the
+  // chapter grows (lazy-loaded pages) resumes warming the new tail.
+  ensureWarmingPipeline(chapterId) {
+    if (!chapterId) {
+      return Promise.resolve();
+    }
+    const existing = this.activeWarmups.get(chapterId);
+    if (existing) {
+      return existing;
+    }
+    const pipeline = this.runWarmingPipeline(chapterId)
+      .catch(() => {})
+      .finally(() => {
+        this.activeWarmups.delete(chapterId);
+      });
+    this.activeWarmups.set(chapterId, pipeline);
+    return pipeline;
+  }
+
+  async runWarmingPipeline(chapterId) {
+    const attemptedChunkIds = new Set();
+    while (true) {
+      const session = await this.loadSession(chapterId);
+      if (!this.isWarmableSession(session)) {
+        return;
+      }
+
+      const fromChunkIndex = typeof session.currentChunkIndex === "number" ? session.currentChunkIndex : -1;
+      const chunk = await this.findNextChunkToWarm(chapterId, fromChunkIndex);
+      if (!chunk || attemptedChunkIds.has(chunk.chunkId)) {
+        return;
+      }
+      attemptedChunkIds.add(chunk.chunkId);
+
+      try {
+        const blob = await this.fetchAudioForChunk(session, chunk);
+        await this.saveAudioRecord({
+          chunkId: chunk.chunkId,
+          chapterId,
+          chunkIndex: chunk.chunkIndex,
+          blob,
+          mimeType: blob?.type || "audio/wav",
+          createdAt: Date.now()
+        });
+        await this.markChunkStatus(chunk.chunkId, "ready");
+      } catch (error) {
+        await this.markChunkStatus(chunk.chunkId, "failed").catch(() => {});
+        this.log("warmup_chunk_failed", session, { chunkId: chunk.chunkId, error: String(error) });
+      }
+    }
   }
 
   async sendPageCommand(tabId, message) {
@@ -396,6 +503,7 @@ export class PlaybackQueue {
 
     await this.mergeChapterChunkData(refreshedSession, chapter, chunks, existingChunks);
     await this.saveSession(refreshedSession);
+    void this.ensureWarmingPipeline(refreshedSession.chapterId);
     if (resumePlayback) {
       await this.processSession(refreshedSession.chapterId);
     }
@@ -771,6 +879,7 @@ export class PlaybackQueue {
         };
         await this.ensureChapterData(resumedSession);
         await this.saveSession(resumedSession);
+        void this.ensureWarmingPipeline(activeChapterId);
         return this.getState(activeChapterId);
       }
     }
@@ -1011,6 +1120,7 @@ export class PlaybackQueue {
       return;
     }
 
+    void this.ensureWarmingPipeline(chapterId);
     await this.ensureOffscreenDocument();
     await this.startCurrentChunkStream(chapterId);
   }

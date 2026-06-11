@@ -108,3 +108,59 @@ test("popup shows active streamed playback once transport is live", () => {
   assert.equal(view.transport, "Transport: playing");
   assert.equal(view.playback, "Playback: playing");
 });
+
+test("popup reports how many chunks are warmed in the audio cache", () => {
+  const view = buildPopupViewModel({
+    stateAvailable: true,
+    state: "awaiting_chunk_end",
+    warmupStatus: "ready",
+    transportStatus: "playing",
+    playRequested: true,
+    playbackStatus: "playing",
+    streamStatus: "playing",
+    currentChunkIndex: 2,
+    totalChunks: 10,
+    currentChunkId: "chunk-3",
+    chapterReadyAudioCount: 6,
+    readyAudioCount: 6,
+    bufferedAudioMs: 220,
+    bytesReceived: 56000,
+    firstByteAt: 10,
+    firstAudioAt: 20,
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    cacheType: "temporary",
+    partId: "1407678433",
+    lastEvent: "playback_started",
+    errorMessage: null
+  });
+
+  assert.equal(view.warmed, "Warmed: 6 of 10 chunks");
+});
+
+test("popup warmed count never exceeds the chapter total", () => {
+  const view = buildPopupViewModel({
+    stateAvailable: true,
+    state: "awaiting_chunk_end",
+    warmupStatus: "ready",
+    transportStatus: "playing",
+    playRequested: true,
+    playbackStatus: "playing",
+    streamStatus: "playing",
+    currentChunkIndex: 2,
+    totalChunks: 4,
+    currentChunkId: "chunk-3",
+    chapterReadyAudioCount: 9,
+    readyAudioCount: 9,
+    bufferedAudioMs: 0,
+    bytesReceived: 0,
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    cacheType: "temporary",
+    partId: "1407678433",
+    lastEvent: "playback_started",
+    errorMessage: null
+  });
+
+  assert.equal(view.warmed, "Warmed: 4 of 4 chunks");
+});
