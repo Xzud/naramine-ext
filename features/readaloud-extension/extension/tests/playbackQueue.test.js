@@ -1872,3 +1872,171 @@ test("warming pipeline is single-flight per chapter", async () => {
   const expected = chapter.chunks.slice(1).map((chunk) => chunk.chunkId);
   assert.deepEqual(queue.warmedChunkIds, expected);
 });
+
+test("pause folds the playback clock and resume restarts it", async () => {
+  const queue = new TestPlaybackQueue();
+  queue.resumeOffscreenPlayback = async () => ({ ok: true, resumed: true, chunkId: "chapter-clock:0:h1" });
+  await queue.setActiveChapterId("chapter-clock");
+
+  const startedAt = Date.now() - 5000;
+  await queue.saveSession(
+    buildPlayingSession("chapter-clock", {
+      playbackElapsedMs: 10000,
+      playbackResumedAt: startedAt
+    })
+  );
+
+  await queue.pause("chapter-clock");
+  const pausedSession = await queue.loadSession("chapter-clock");
+  assert.equal(pausedSession.playbackResumedAt, null);
+  assert.ok(pausedSession.playbackElapsedMs >= 15000);
+  assert.ok(pausedSession.playbackElapsedMs < 16000);
+
+  const pausedForState = { ...pausedSession, state: "paused" };
+  await queue.saveSession(pausedForState);
+  await queue.start();
+  const resumedSession = await queue.loadSession("chapter-clock");
+  assert.equal(typeof resumedSession.playbackResumedAt, "number");
+  assert.ok(resumedSession.playbackElapsedMs >= 15000);
+});
+
+test("chunk start begins the playback clock without resetting accumulated time", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.saveSession(
+    buildPlayingSession("chapter-clock-start", {
+      playbackElapsedMs: 42000,
+      playbackResumedAt: null
+    })
+  );
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-clock-start",
+    chunkId: "chapter-clock-start:0:h1",
+    attemptId: "chapter-clock-start:attempt:1"
+  });
+
+  const session = await queue.loadSession("chapter-clock-start");
+  assert.equal(session.playbackElapsedMs, 42000);
+  assert.equal(typeof session.playbackResumedAt, "number");
+});
+
+test("chapter end stops the playback clock", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.saveSession(
+    buildPlayingSession("chapter-clock-end", {
+      currentChunkIndex: 2,
+      currentChunkId: "chapter-clock-end:2:h3",
+      totalChunks: 3,
+      playbackElapsedMs: 20000,
+      playbackResumedAt: Date.now() - 3000
+    })
+  );
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_ENDED",
+    chapterId: "chapter-clock-end",
+    chunkId: "chapter-clock-end:2:h3",
+    attemptId: "chapter-clock-end:attempt:1"
+  });
+
+  const session = await queue.loadSession("chapter-clock-end");
+  assert.equal(session.state, "ended");
+  assert.equal(session.playbackResumedAt, null);
+  assert.ok(session.playbackElapsedMs >= 23000);
+});
+
+test("clicking a paragraph mid-playback dispatches the clicked chunk through the real stream path", async () => {
+  const chapterId = "chap-click-real";
+  const paragraphs = Array.from({ length: 8 }, (_value, index) => ({
+    paragraphId: `p-${index}`,
+    text: `Paragraph ${index} with some longer content to chunk properly and reasonably.`
+  }));
+  const text = paragraphs.map((paragraph) => paragraph.text).join("\n\n");
+  const chunks = chunkText(text, { storyId: "story", chapterId, paragraphs });
+
+  const queue = new LazyLoadPlaybackQueue({
+    chunkStore: chunks.map((chunk) => ({ ...chunk, status: "pending" })),
+    chapterRecord: {
+      chapterId,
+      storyId: "story",
+      title: "T",
+      sourceUrl: "u",
+      textHash: stableHash(text),
+      createdAt: 1,
+      expiresAt: Date.now() + 86400000
+    }
+  });
+  queue.tabsApi.sendMessage = async (tabId, message) => {
+    queue.tabMessages.push({ tabId, message });
+    if (message.type === "READALOUD_EXTRACT_TEXT") {
+      return {
+        ok: true,
+        text,
+        paragraphs,
+        title: "T",
+        sourceUrl: "u",
+        storyId: "story",
+        partId: chapterId,
+        strategy: "dom-paragraphs",
+        confidence: "high"
+      };
+    }
+    return { ok: true };
+  };
+  // Use the real dispatch path instead of the TestPlaybackQueue stubs.
+  queue.startCurrentChunkStream = PlaybackQueue.prototype.startCurrentChunkStream.bind(queue);
+  queue.getAudioRecordsForChapter = async () => [];
+  queue.saveAudioRecord = async () => {};
+  queue.markChunkStatus = async () => {};
+  queue.fetchAudioForChunk = async () => ({ type: "audio/wav" });
+
+  await queue.setActiveChapterId(chapterId);
+  await queue.saveSession(
+    buildPlayingSession(chapterId, {
+      tabId: 123,
+      text,
+      paragraphs,
+      currentChunkId: chunks[0].chunkId,
+      totalChunks: chunks.length
+    })
+  );
+
+  const laterChunk = chunks.find((chunk) => chunk.chunkIndex >= 2) || chunks.at(-1);
+  const clickedParagraphId = (laterChunk.paragraphIds || [])[0];
+  assert.ok(clickedParagraphId);
+
+  const state = await queue.playFromParagraph({ chapterId, paragraphId: clickedParagraphId, tabId: 123 });
+
+  assert.equal(queue.sentMessages.some((message) => message.type === "STOP_PLAYBACK"), true);
+  const dispatched = queue.sentMessages.filter((message) => message.type === "START_STREAM_PLAYBACK");
+  assert.equal(dispatched.at(-1)?.chunkId, laterChunk.chunkId);
+  assert.equal(state.currentChunkId, laterChunk.chunkId);
+  assert.notEqual(state.state, "error");
+});
+
+test("a stale started event from the previous chunk does not override a paragraph jump", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.saveSession(
+    buildPlayingSession("chapter-stale-start", {
+      state: "playback_starting",
+      playbackStatus: "dispatching",
+      currentChunkIndex: 5,
+      currentChunkId: "chapter-stale-start:5:h6",
+      totalChunks: 8,
+      streamStatus: "connecting"
+    })
+  );
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-stale-start",
+    chunkId: "chapter-stale-start:0:h1",
+    attemptId: "chapter-stale-start:attempt:0"
+  });
+
+  const session = await queue.loadSession("chapter-stale-start");
+  assert.equal(session.currentChunkId, "chapter-stale-start:5:h6");
+  assert.equal(session.playbackStatus, "dispatching");
+  assert.equal(session.streamStatus, "connecting");
+});

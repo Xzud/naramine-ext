@@ -82,6 +82,20 @@ export class PlaybackQueue {
     return result;
   }
 
+  // The popup timer derives from playbackElapsedMs plus a live component
+  // while playbackResumedAt is set; folding stops the clock exactly when
+  // audio stops (pause, stop, chapter end, fatal error).
+  foldPlaybackClock(session, now = Date.now()) {
+    if (!session.playbackResumedAt) {
+      return session;
+    }
+    return {
+      ...session,
+      playbackElapsedMs: (session.playbackElapsedMs || 0) + Math.max(0, now - session.playbackResumedAt),
+      playbackResumedAt: null
+    };
+  }
+
   log(event, session = {}, extra = {}) {
     const chapterId = session.chapterId || extra.chapterId || DEFAULT_CHAPTER_ID;
     const chunkId = session.currentChunkId || extra.chunkId || "-";
@@ -768,7 +782,7 @@ export class PlaybackQueue {
     }
 
     const failedSession = {
-      ...session,
+      ...this.foldPlaybackClock(session),
       state: "error",
       playbackStatus: "error",
       streamStatus: "error",
@@ -824,6 +838,8 @@ export class PlaybackQueue {
       firstByteAt: null,
       firstAudioAt: null,
       stallCount: 0,
+      playbackElapsedMs: 0,
+      playbackResumedAt: null,
       ...overrides
     };
   }
@@ -850,6 +866,8 @@ export class PlaybackQueue {
       firstByteAt: null,
       firstAudioAt: null,
       stallCount: 0,
+      playbackElapsedMs: 0,
+      playbackResumedAt: null,
       ...overrides
     };
   }
@@ -874,6 +892,7 @@ export class PlaybackQueue {
           playbackStatus: hasStarted ? "playing" : "starting",
           state: hasStarted ? "awaiting_chunk_end" : "playback_starting",
           streamStatus: hasStarted ? "playing" : "receiving",
+          playbackResumedAt: hasStarted ? Date.now() : existingSession.playbackResumedAt || null,
           lastEvent: "session_resumed",
           errorMessage: null
         };
@@ -997,7 +1016,7 @@ export class PlaybackQueue {
     }
 
     const pausedSession = {
-      ...session,
+      ...this.foldPlaybackClock(session),
       paused: true,
       playRequested: false,
       state: "paused",
@@ -1019,7 +1038,7 @@ export class PlaybackQueue {
     const session = await this.loadSession(resolvedChapterId);
     if (session) {
       const stoppedSession = {
-        ...session,
+        ...this.foldPlaybackClock(session),
         stopped: true,
         playRequested: false,
         state: "ended",
@@ -1133,7 +1152,7 @@ export class PlaybackQueue {
 
     if (session.currentChunkIndex >= session.totalChunks) {
       const endedSession = {
-        ...session,
+        ...this.foldPlaybackClock(session),
         state: "ended",
         playbackStatus: "ended",
         streamStatus: "ended",
@@ -1166,6 +1185,7 @@ export class PlaybackQueue {
           playbackStatus: hasStarted ? "playing" : "starting",
           state: hasStarted ? "awaiting_chunk_end" : "playback_starting",
           streamStatus: hasStarted ? "playing" : "receiving",
+          playbackResumedAt: hasStarted ? Date.now() : session.playbackResumedAt || null,
           lastEvent: "stream_resumed"
         });
         return true;
@@ -1307,6 +1327,12 @@ export class PlaybackQueue {
     }
 
     if (message.type === "CHUNK_PLAYBACK_STARTED") {
+      if (message.chunkId && session.currentChunkId && session.currentChunkId !== message.chunkId) {
+        // Stale started event from a chunk we already navigated away from
+        // (e.g. the user clicked another paragraph while it was in flight).
+        return;
+      }
+
       if (session.paused) {
         // A pause landed while the start event was in flight; the offscreen
         // player is already suspended. Record the start without unpausing.
@@ -1325,7 +1351,8 @@ export class PlaybackQueue {
         bytesReceived: message.bytesReceived || session.bytesReceived || 0,
         bufferedAudioMs: message.bufferedAudioMs || session.bufferedAudioMs || 0,
         firstByteAt: message.firstByteAt || session.firstByteAt || Date.now(),
-        firstAudioAt: message.firstAudioAt || session.firstAudioAt || Date.now()
+        firstAudioAt: message.firstAudioAt || session.firstAudioAt || Date.now(),
+        playbackResumedAt: session.playbackResumedAt || Date.now()
       };
       await this.saveSession(startedSession);
       await this.focusChunkOnPage(startedSession, message.chunkId, { clearPrevious: true }).catch(() => {});
@@ -1338,9 +1365,11 @@ export class PlaybackQueue {
       if (!result.advanced) {
         return;
       }
+      const advancedSession =
+        result.session.state === "ended" ? this.foldPlaybackClock(result.session) : result.session;
       await this.saveSession({
-        ...result.session,
-        streamStatus: result.session.state === "ended" ? "ended" : "idle",
+        ...advancedSession,
+        streamStatus: advancedSession.state === "ended" ? "ended" : "idle",
         bytesReceived: 0,
         bufferedAudioMs: 0
       });
@@ -1369,7 +1398,7 @@ export class PlaybackQueue {
         message.attemptId || null
       );
       await this.saveSession({
-        ...result.session,
+        ...(result.retryScheduled ? result.session : this.foldPlaybackClock(result.session)),
         streamStatus: result.retryScheduled ? "idle" : "error"
       });
       if (!result.retryScheduled) {
@@ -1397,7 +1426,7 @@ export class PlaybackQueue {
         message.attemptId || null
       );
       await this.saveSession({
-        ...result.session,
+        ...(result.retryScheduled ? result.session : this.foldPlaybackClock(result.session)),
         streamStatus: result.retryScheduled ? "idle" : "error"
       });
       if (!result.retryScheduled) {
@@ -1609,7 +1638,9 @@ export class PlaybackQueue {
       bufferedAudioMs: 0,
       firstByteAt: null,
       firstAudioAt: null,
-      stallCount: 0
+      stallCount: 0,
+      playbackElapsedMs: 0,
+      playbackResumedAt: null
     };
 
     await this.setActiveChapterId(chapterId);

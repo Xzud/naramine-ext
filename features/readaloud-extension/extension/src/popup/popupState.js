@@ -1,203 +1,70 @@
-import { createUnavailableRuntimeState } from "../audio/runtimeState.js";
+const PAUSEABLE_PLAYBACK_STATUSES = new Set(["dispatching", "starting", "playing", "awaiting_chunk_end"]);
 
-function formatConfidence(strategy, confidence) {
-  if (!strategy && !confidence) {
-    return "Extraction: unavailable";
+export function isPauseable(state) {
+  if (!state?.stateAvailable) {
+    return false;
   }
 
-  return `Extraction: ${strategy || "unknown"} (${confidence || "unknown"})`;
+  return PAUSEABLE_PLAYBACK_STATUSES.has(state.playbackStatus);
 }
 
-function formatProgress(state) {
-  if (!state.stateAvailable) {
-    return "Current chunk: unavailable";
+export function computeElapsedMs(state, now = Date.now()) {
+  if (!state?.stateAvailable) {
+    return 0;
+  }
+
+  const base = state.playbackElapsedMs || 0;
+  if (state.playbackResumedAt) {
+    return base + Math.max(0, now - state.playbackResumedAt);
+  }
+  return base;
+}
+
+export function formatTimer(elapsedMs) {
+  const totalSeconds = Math.floor(Math.max(0, elapsedMs || 0) / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${seconds}`;
+  }
+  return `${minutes}:${seconds}`;
+}
+
+export function getWarmedRatio(state) {
+  if (!state?.stateAvailable || !state.totalChunks) {
+    return 0;
+  }
+
+  return Math.min(state.readyAudioCount || 0, state.totalChunks) / state.totalChunks;
+}
+
+export function getChapterRatio(state) {
+  if (!state?.stateAvailable || !state.totalChunks || typeof state.currentChunkIndex !== "number") {
+    return 0;
   }
 
   if (state.state === "idle") {
-    return state.totalChunks > 0
-      ? `Current chunk: not started of ${state.totalChunks}`
-      : "Current chunk: not started";
+    return 0;
   }
 
-  if (typeof state.currentChunkIndex !== "number" || state.totalChunks <= 0) {
-    return "Current chunk: unavailable";
-  }
-
-  return `Current chunk: ${Math.min(state.currentChunkIndex + 1, state.totalChunks)} of ${state.totalChunks}`;
+  return Math.min(state.currentChunkIndex + 1, state.totalChunks) / state.totalChunks;
 }
 
-function formatStartupProgress(state) {
-  if (!state.stateAvailable) {
-    return "Startup stream buffer: unavailable";
-  }
-
-  if (state.firstAudioAt) {
-    return `Startup stream buffer: live (${state.bufferedAudioMs || 0} ms buffered)`;
-  }
-
-  if (state.streamStatus === "connecting" || state.streamStatus === "receiving" || state.streamStatus === "buffering") {
-    return `Startup stream buffer: ${state.bufferedAudioMs || 0} ms buffered`;
-  }
-
-  if (!state.playRequested) {
-    return "Startup stream buffer: waiting for play";
-  }
-
-  return "Startup stream buffer: pending";
-}
-
-function formatSessionState(state) {
-  const warmupStatus = state.warmupStatus || state.state;
-
-  if (warmupStatus === "warming") {
-    return "warming chapter in background";
-  }
-
-  if (warmupStatus === "warm_ready") {
-    return "warm buffer ready";
-  }
-
-  if (warmupStatus === "starting") {
-    return "preparing playback start";
-  }
-
-  if (warmupStatus === "ready") {
-    return "ready for playback";
-  }
-
-  return state.state || "idle";
-}
-
-function formatPlayback(state) {
-  if (state.lastEvent === "playback_start_interrupted_retry_scheduled") {
-    return "retrying interrupted startup";
-  }
-
-  if (state.transportStatus === "paused") {
-    return "paused";
-  }
-
-  if (state.transportStatus === "playing") {
-    return "playing";
-  }
-
-  if (state.transportStatus === "starting") {
-    return "starting stream playback";
-  }
-
-  if (!state.playRequested && ["preparing", "startup_buffering"].includes(state.state)) {
-    return "warming in background";
-  }
-
-  if (!state.playRequested && state.state === "startup_ready") {
-    return "ready when you press play";
-  }
-
-  if (state.playRequested && ["playback_starting", "preparing", "startup_buffering"].includes(state.state)) {
-    return "waiting for live stream";
-  }
-
-  if (state.playRequested && state.state === "startup_ready" && state.playbackStatus === "idle") {
-    return "ready to start";
-  }
-
-  return state.playbackStatus || "idle";
-}
-
-function formatWarmupStatus(state) {
-  if (!state.stateAvailable) {
-    return "Warmup: unavailable";
-  }
-
-  const value = state.warmupStatus || "idle";
-  return `Warmup: ${value}`;
-}
-
-function formatTransportStatus(state) {
-  if (!state.stateAvailable) {
-    return "Transport: unavailable";
-  }
-
-  const value = state.transportStatus || "idle";
-  return `Transport: ${value}`;
-}
-
-function formatWarmedAudio(state) {
-  if (!state.stateAvailable) {
-    return "Warmed: unavailable";
-  }
-
-  if (!state.totalChunks) {
-    return "Warmed: no chapter loaded";
-  }
-
-  const warmedCount = Math.min(state.readyAudioCount || 0, state.totalChunks);
-  return `Warmed: ${warmedCount} of ${state.totalChunks} chunks`;
-}
-
-function formatIntent(state) {
-  if (!state.stateAvailable) {
-    return "Intent: unavailable";
-  }
-
-  if (state.playRequested) {
-    return `Intent: play requested (autoplay ${state.autoplayAllowed ? "on" : "off"})`;
-  }
-
-  if (state.pageDetected && state.pageEligible) {
-    return `Intent: warmup only (autoplay ${state.autoplayAllowed ? "on" : "off"})`;
-  }
-
-  if (state.pageDetected && !state.pageEligible) {
-    return "Intent: page detected, not eligible";
-  }
-
-  return "Intent: idle";
-}
-
-export function buildPopupViewModel(inputState) {
-  const state = inputState || createUnavailableRuntimeState("No state returned from the extension.");
-
-  if (!state.stateAvailable) {
-    return {
-      availability: "State unavailable",
-      state: "Session state: unavailable",
-      playback: "Playback: unavailable",
-      progress: "Current chunk: unavailable",
-      chunk: "Chunk ID: unavailable",
-      startup: "Startup stream buffer: unavailable",
-      warmup: "Warmup: unavailable",
-      transport: "Transport: unavailable",
-      intent: "Intent: unavailable",
-      buffer: "Live stream buffer: unavailable",
-      warmed: "Warmed: unavailable",
-      cache: "Cache: unavailable",
-      source: "Extraction: unavailable",
-      part: "Part ID: unavailable",
-      event: "Last event: state_unavailable",
-      error: `Last error: ${state.errorMessage || state.unavailableReason || "Unknown runtime error"}`
-    };
-  }
-
-  const playback = formatPlayback(state);
-  const error = state.errorMessage || "none";
+export function buildPopupViewModel(state, now = Date.now()) {
+  const available = Boolean(state?.stateAvailable);
 
   return {
-    availability: "State live",
-    state: `Session state: ${formatSessionState(state)}`,
-    playback: `Playback: ${playback}`,
-    progress: formatProgress(state),
-    chunk: `Chunk ID: ${state.currentChunkId || "none"}`,
-    startup: formatStartupProgress(state),
-    warmup: formatWarmupStatus(state),
-    transport: formatTransportStatus(state),
-    intent: formatIntent(state),
-    buffer: `Live stream buffer: ${state.bufferedAudioMs || 0} ms, ${state.bytesReceived || 0} bytes`,
-    warmed: formatWarmedAudio(state),
-    cache: `Cache: ${state.cacheType}`,
-    source: formatConfidence(state.extractionStrategy, state.extractionConfidence),
-    part: `Part ID: ${state.partId || "none"}`,
-    event: `Last event: ${state.lastEvent || "idle"}`,
-    error: `Last error: ${error}`
+    title: (available && state.title) || "Read Aloud",
+    pauseable: isPauseable(state),
+    timerLabel: formatTimer(computeElapsedMs(state, now)),
+    timerRunning: Boolean(available && state.playbackResumedAt),
+    warmedRatio: getWarmedRatio(state),
+    chapterRatio: getChapterRatio(state),
+    errorMessage:
+      available && state.state !== "error" && state.playbackStatus !== "error"
+        ? null
+        : state?.errorMessage || state?.unavailableReason || null
   };
 }

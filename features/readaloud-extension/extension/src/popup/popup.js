@@ -1,105 +1,12 @@
 import { createUnavailableRuntimeState } from "../audio/runtimeState.js";
-import { buildPopupViewModel } from "./popupState.js";
+import { buildPopupViewModel, isPauseable } from "./popupState.js";
 
-function setText(id, value) {
-  const element = document.getElementById(id);
-  if (element) {
-    element.textContent = value;
-  }
-}
+const PLAY_ICON_PATH =
+  '<path d="M8 6.82v10.36c0 .79.87 1.27 1.54.84l8.14-5.18a1 1 0 0 0 0-1.68L9.54 5.98A1 1 0 0 0 8 6.82Z" />';
+const PAUSE_ICON_PATH =
+  '<path d="M8 5h3a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Zm5 1a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1Z" />';
 
-function setMarkup(id, value) {
-  const element = document.getElementById(id);
-  if (element) {
-    element.innerHTML = value;
-  }
-}
-
-function setWidth(id, ratio) {
-  const element = document.getElementById(id);
-  if (element) {
-    const safeRatio = Math.max(0, Math.min(1, Number.isFinite(ratio) ? ratio : 0));
-    element.style.width = `${safeRatio * 100}%`;
-  }
-}
-
-function setBadge(state) {
-  const badge = document.getElementById("availabilityBadge");
-  if (!badge) {
-    return;
-  }
-
-  const isError = !state.stateAvailable || state.state === "error" || state.playbackStatus === "error";
-  const isPlaying = state.transportStatus === "playing";
-  const isWarm = ["warming", "warm_ready", "starting", "ready"].includes(state.warmupStatus);
-  badge.className = `badge ${isError ? "error" : "live"}`;
-  badge.textContent = isError ? "Attention" : isPlaying ? "Playing" : isWarm ? "Warm" : "Live";
-}
-
-function setHeroTitle(state) {
-  const title =
-    state.title ||
-    (state.partId ? `Part ${state.partId}` : state.stateAvailable ? "Wattpad Session" : "Waiting for Session");
-  setText("heroTitle", title);
-}
-
-function getChapterRatio(state) {
-  if (!state.stateAvailable || !state.totalChunks) {
-    return 0;
-  }
-
-  if (typeof state.currentChunkIndex !== "number") {
-    return state.state === "idle" ? 0 : 0;
-  }
-
-  return Math.min(state.currentChunkIndex + 1, state.totalChunks) / state.totalChunks;
-}
-
-function getStartupRatio(state) {
-  if (!state.stateAvailable) {
-    return 0;
-  }
-
-  if (state.firstAudioAt) {
-    return 1;
-  }
-
-  if (state.streamStatus === "connecting") {
-    return 0.2;
-  }
-
-  if (state.streamStatus === "receiving" || state.streamStatus === "buffering") {
-    return Math.min((state.bufferedAudioMs || 0) / 250, 0.9);
-  }
-
-  return 0;
-}
-
-function getWarmedRatio(state) {
-  if (!state.stateAvailable || !state.totalChunks) {
-    return 0;
-  }
-
-  return Math.min(state.readyAudioCount || 0, state.totalChunks) / state.totalChunks;
-}
-
-function isPauseable(state) {
-  if (!state?.stateAvailable) {
-    return false;
-  }
-
-  return ["dispatching", "starting", "playing", "awaiting_chunk_end"].includes(state.playbackStatus);
-}
-
-function syncTransportButton(state) {
-  setText("playLabel", isPauseable(state) ? "Pause" : "Play");
-  setMarkup(
-    "playIcon",
-    isPauseable(state)
-      ? '<path d="M8 5h3a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Zm5 1a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1Z" />'
-      : '<path d="M8 6.82v10.36c0 .79.87 1.27 1.54.84l8.14-5.18a1 1 0 0 0 0-1.68L9.54 5.98A1 1 0 0 0 8 6.82Z" />'
-  );
-}
+let lastState = null;
 
 async function request(type, payload = {}) {
   try {
@@ -113,55 +20,49 @@ async function request(type, payload = {}) {
   }
 }
 
-function renderState(state) {
-  const view = buildPopupViewModel(state);
-  setHeroTitle(state);
-  setBadge(state);
-  setText("availability", view.availability);
-  setText("state", view.state);
-  setText("playback", view.playback);
-  setText("progress", view.progress);
-  setText("chunk", view.chunk);
-  setText("startup", view.startup);
-  setText("warmup", view.warmup);
-  setText("transport", view.transport);
-  setText("intent", view.intent);
-  setText("buffer", view.buffer);
-  setText("warmed", view.warmed);
-  setText("cache", view.cache);
-  setText("source", view.source);
-  setText("part", view.part);
-  setText("event", view.event);
-  setText("error", view.error);
-  setWidth("chapterMeter", getChapterRatio(state));
-  setWidth("startupMeter", getStartupRatio(state));
-  setWidth("warmedMeter", getWarmedRatio(state));
-  syncTransportButton(state);
+function render() {
+  const view = buildPopupViewModel(lastState, Date.now());
+
+  document.getElementById("title").textContent = view.title;
+
+  const playButton = document.getElementById("play");
+  playButton.setAttribute("aria-label", view.pauseable ? "Pause" : "Play");
+  document.getElementById("playIcon").innerHTML = view.pauseable ? PAUSE_ICON_PATH : PLAY_ICON_PATH;
+
+  const timer = document.getElementById("timer");
+  timer.textContent = view.timerLabel;
+  timer.classList.toggle("idle", !view.timerRunning);
+
+  document.getElementById("warmedFill").style.width = `${view.warmedRatio * 100}%`;
+  document.getElementById("playedFill").style.width = `${view.chapterRatio * 100}%`;
+
+  const error = document.getElementById("error");
+  error.hidden = !view.errorMessage;
+  error.textContent = view.errorMessage || "";
 }
 
-let lastRenderedState = createUnavailableRuntimeState("Waiting for runtime state.");
-
-renderState(lastRenderedState);
-
 async function refreshState() {
-  const state = await request("GET_STATE");
-  lastRenderedState = state;
-  renderState(state);
+  lastState = await request("GET_STATE");
+  render();
 }
 
 document.getElementById("play")?.addEventListener("click", async () => {
-  const state = await request(isPauseable(lastRenderedState) ? "PAUSE" : "PLAY");
-  lastRenderedState = state;
-  renderState(state);
+  lastState = await request(isPauseable(lastState) ? "PAUSE" : "PLAY");
+  render();
 });
 
 document.getElementById("stop")?.addEventListener("click", async () => {
-  const state = await request("STOP");
-  lastRenderedState = state;
-  renderState(state);
+  lastState = await request("STOP");
+  render();
 });
 
-document.getElementById("refresh")?.addEventListener("click", refreshState);
-
+render();
 refreshState();
 setInterval(refreshState, 1500);
+// Tick the timer locally between polls; it only advances while the session
+// reports a live playback clock.
+setInterval(() => {
+  if (lastState?.playbackResumedAt) {
+    render();
+  }
+}, 250);

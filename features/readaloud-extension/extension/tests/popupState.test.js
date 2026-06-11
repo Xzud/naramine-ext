@@ -2,165 +2,101 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createUnavailableRuntimeState } from "../src/audio/runtimeState.js";
-import { buildPopupViewModel } from "../src/popup/popupState.js";
+import {
+  buildPopupViewModel,
+  computeElapsedMs,
+  formatTimer,
+  getChapterRatio,
+  getWarmedRatio,
+  isPauseable
+} from "../src/popup/popupState.js";
 
-test("popup-safe unavailable state does not invent playback metrics", () => {
-  const view = buildPopupViewModel(createUnavailableRuntimeState("The service worker could not be reached."));
-
-  assert.equal(view.availability, "State unavailable");
-  assert.equal(view.progress, "Current chunk: unavailable");
-  assert.equal(view.chunk, "Chunk ID: unavailable");
-  assert.equal(view.warmup, "Warmup: unavailable");
-  assert.equal(view.transport, "Transport: unavailable");
-  assert.match(view.error, /could not be reached/i);
-});
-
-test("popup shows live stream startup metrics before first audio", () => {
-  const view = buildPopupViewModel({
-    stateAvailable: true,
-    state: "playback_starting",
-    warmupStatus: "starting",
-    transportStatus: "starting",
-    playRequested: true,
-    playbackStatus: "starting",
-    streamStatus: "buffering",
-    currentChunkIndex: 0,
-    totalChunks: 9,
-    currentChunkId: "chunk-0",
-    chapterReadyAudioCount: 0,
-    readyAudioCount: 0,
-    bufferedAudioMs: 180,
-    bytesReceived: 24000,
-    firstByteAt: 123,
-    firstAudioAt: null,
-    extractionStrategy: "dom-paragraphs",
-    extractionConfidence: "high",
-    cacheType: "temporary",
-    partId: "1407678433",
-    lastEvent: "stream_dispatch_accepted",
-    errorMessage: null
-  });
-
-  assert.equal(view.state, "Session state: preparing playback start");
-  assert.equal(view.startup, "Startup stream buffer: 180 ms buffered");
-  assert.equal(view.transport, "Transport: starting");
-  assert.equal(view.playback, "Playback: starting stream playback");
-  assert.equal(view.buffer, "Live stream buffer: 180 ms, 24000 bytes");
-});
-
-test("popup distinguishes passive warmup from play-requested streaming", () => {
-  const view = buildPopupViewModel({
-    stateAvailable: true,
-    state: "startup_ready",
-    warmupStatus: "warm_ready",
-    transportStatus: "idle",
-    playRequested: false,
-    playbackStatus: "idle",
-    streamStatus: "idle",
-    currentChunkIndex: 0,
-    totalChunks: 9,
-    currentChunkId: null,
-    chapterReadyAudioCount: 0,
-    readyAudioCount: 0,
-    bufferedAudioMs: 0,
-    bytesReceived: 0,
-    extractionStrategy: "dom-paragraphs",
-    extractionConfidence: "high",
-    cacheType: "temporary",
-    partId: "1407678433",
-    lastEvent: "chapter_ready_for_streaming",
-    errorMessage: null
-  });
-
-  assert.equal(view.state, "Session state: warm buffer ready");
-  assert.equal(view.playback, "Playback: ready when you press play");
-  assert.equal(view.startup, "Startup stream buffer: waiting for play");
-});
-
-test("popup shows active streamed playback once transport is live", () => {
-  const view = buildPopupViewModel({
+function buildState(overrides = {}) {
+  return {
     stateAvailable: true,
     state: "awaiting_chunk_end",
-    warmupStatus: "ready",
-    transportStatus: "playing",
-    playRequested: true,
     playbackStatus: "playing",
-    streamStatus: "playing",
-    currentChunkIndex: 1,
-    totalChunks: 4,
-    currentChunkId: "chunk-2",
-    chapterReadyAudioCount: 0,
-    readyAudioCount: 0,
-    bufferedAudioMs: 220,
-    bytesReceived: 56000,
-    firstByteAt: 10,
-    firstAudioAt: 20,
-    extractionStrategy: "dom-paragraphs",
-    extractionConfidence: "high",
-    cacheType: "temporary",
-    partId: "1407678433",
-    lastEvent: "playback_started",
-    errorMessage: null
-  });
-
-  assert.equal(view.state, "Session state: ready for playback");
-  assert.equal(view.startup, "Startup stream buffer: live (220 ms buffered)");
-  assert.equal(view.transport, "Transport: playing");
-  assert.equal(view.playback, "Playback: playing");
-});
-
-test("popup reports how many chunks are warmed in the audio cache", () => {
-  const view = buildPopupViewModel({
-    stateAvailable: true,
-    state: "awaiting_chunk_end",
-    warmupStatus: "ready",
-    transportStatus: "playing",
-    playRequested: true,
-    playbackStatus: "playing",
-    streamStatus: "playing",
+    title: "Chapter One",
     currentChunkIndex: 2,
     totalChunks: 10,
-    currentChunkId: "chunk-3",
-    chapterReadyAudioCount: 6,
     readyAudioCount: 6,
-    bufferedAudioMs: 220,
-    bytesReceived: 56000,
-    firstByteAt: 10,
-    firstAudioAt: 20,
-    extractionStrategy: "dom-paragraphs",
-    extractionConfidence: "high",
-    cacheType: "temporary",
-    partId: "1407678433",
-    lastEvent: "playback_started",
-    errorMessage: null
-  });
+    playbackElapsedMs: 65000,
+    playbackResumedAt: null,
+    errorMessage: null,
+    ...overrides
+  };
+}
 
-  assert.equal(view.warmed, "Warmed: 6 of 10 chunks");
+test("formatTimer renders minutes and seconds, with hours when needed", () => {
+  assert.equal(formatTimer(0), "0:00");
+  assert.equal(formatTimer(9000), "0:09");
+  assert.equal(formatTimer(65000), "1:05");
+  assert.equal(formatTimer(3723000), "1:02:03");
 });
 
-test("popup warmed count never exceeds the chapter total", () => {
-  const view = buildPopupViewModel({
-    stateAvailable: true,
-    state: "awaiting_chunk_end",
-    warmupStatus: "ready",
-    transportStatus: "playing",
-    playRequested: true,
-    playbackStatus: "playing",
-    streamStatus: "playing",
-    currentChunkIndex: 2,
-    totalChunks: 4,
-    currentChunkId: "chunk-3",
-    chapterReadyAudioCount: 9,
-    readyAudioCount: 9,
-    bufferedAudioMs: 0,
-    bytesReceived: 0,
-    extractionStrategy: "dom-paragraphs",
-    extractionConfidence: "high",
-    cacheType: "temporary",
-    partId: "1407678433",
-    lastEvent: "playback_started",
-    errorMessage: null
-  });
+test("elapsed time only advances while the playback clock is running", () => {
+  const paused = buildState({ playbackElapsedMs: 30000, playbackResumedAt: null });
+  assert.equal(computeElapsedMs(paused, 1000000), 30000);
 
-  assert.equal(view.warmed, "Warmed: 4 of 4 chunks");
+  const playing = buildState({ playbackElapsedMs: 30000, playbackResumedAt: 995000 });
+  assert.equal(computeElapsedMs(playing, 1000000), 35000);
+});
+
+test("view model shows a frozen timer while paused", () => {
+  const view = buildPopupViewModel(
+    buildState({
+      state: "paused",
+      playbackStatus: "paused",
+      playbackElapsedMs: 125000,
+      playbackResumedAt: null
+    }),
+    1000000
+  );
+
+  assert.equal(view.timerLabel, "2:05");
+  assert.equal(view.timerRunning, false);
+  assert.equal(view.pauseable, false);
+});
+
+test("view model shows a running timer and pause control during playback", () => {
+  const view = buildPopupViewModel(
+    buildState({ playbackElapsedMs: 60000, playbackResumedAt: 998000 }),
+    1000000
+  );
+
+  assert.equal(view.timerLabel, "1:02");
+  assert.equal(view.timerRunning, true);
+  assert.equal(view.pauseable, true);
+});
+
+test("bar ratios reflect played and warmed chunks against the total", () => {
+  const state = buildState({ currentChunkIndex: 4, totalChunks: 10, readyAudioCount: 7 });
+  assert.equal(getChapterRatio(state), 0.5);
+  assert.equal(getWarmedRatio(state), 0.7);
+
+  const overWarmed = buildState({ totalChunks: 4, readyAudioCount: 9 });
+  assert.equal(getWarmedRatio(overWarmed), 1);
+});
+
+test("unavailable state renders a safe empty player", () => {
+  const view = buildPopupViewModel(createUnavailableRuntimeState("Service worker unreachable."), 1000);
+
+  assert.equal(view.title, "Read Aloud");
+  assert.equal(view.timerLabel, "0:00");
+  assert.equal(view.timerRunning, false);
+  assert.equal(view.warmedRatio, 0);
+  assert.equal(view.chapterRatio, 0);
+  assert.match(view.errorMessage, /unreachable/i);
+  assert.equal(isPauseable(createUnavailableRuntimeState("x")), false);
+});
+
+test("errors surface in the view model only when the session failed", () => {
+  const healthy = buildPopupViewModel(buildState(), 1000);
+  assert.equal(healthy.errorMessage, null);
+
+  const failed = buildPopupViewModel(
+    buildState({ state: "error", playbackStatus: "error", errorMessage: "TTS exploded" }),
+    1000
+  );
+  assert.equal(failed.errorMessage, "TTS exploded");
 });

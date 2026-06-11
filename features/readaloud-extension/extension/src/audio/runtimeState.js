@@ -108,6 +108,8 @@ export function createRuntimeState(overrides = {}) {
     firstByteAt: null,
     firstAudioAt: null,
     stallCount: 0,
+    playbackElapsedMs: 0,
+    playbackResumedAt: null,
     warmupStatus: "idle",
     transportStatus: "idle",
     ...overrides
@@ -200,6 +202,8 @@ export function mapSessionToRuntimeState(session, cache = {}, overrides = {}) {
     firstByteAt: session.firstByteAt || null,
     firstAudioAt: session.firstAudioAt || null,
     stallCount: session.stallCount || 0,
+    playbackElapsedMs: session.playbackElapsedMs || 0,
+    playbackResumedAt: session.playbackResumedAt || null,
     warmupStatus: deriveWarmupStatus({
       stateAvailable: true,
       state,
