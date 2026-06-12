@@ -31,6 +31,12 @@ async function handleScopedRequest(message, sender) {
       return queue.stop(message.payload?.chapterId || null);
     case "GET_STATE":
       return queue.getState(message.payload?.chapterId || null);
+    case "LIBRARY_GET":
+      return queue.getLibrary();
+    case "LIBRARY_DELETE_CHAPTER":
+      return queue.deleteDownloadedChapter(message.payload?.chapterId || null);
+    case "LIBRARY_DELETE_STORY":
+      return queue.deleteDownloadedStory(message.payload?.storyId || null);
     default:
       return queue.buildRequestFailureState(
         getChapterIdFromMessage(message),

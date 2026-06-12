@@ -168,6 +168,7 @@ export async function getNextPendingChunk(chapterId, minChunkIndex = 0) {
 export async function saveAudioChunk(record) {
   const payload = {
     ...record,
+    sizeBytes: typeof record.sizeBytes === "number" ? record.sizeBytes : record.blob?.size || 0,
     expiresAt: record.expiresAt || Date.now() + CACHE_TTL_MS
   };
   return withTransaction(["audioChunks"], "readwrite", ({ audioChunks }) => promisifyRequest(audioChunks.put(payload)));
@@ -199,6 +200,37 @@ export async function getChunkByIndex(chapterId, chunkIndex) {
 export async function getAudioChunkByIndex(chapterId, chunkIndex) {
   return withTransaction(["audioChunks"], "readonly", ({ audioChunks }) =>
     promisifyRequest(audioChunks.index("chapterId_chunkIndex").get([chapterId, chunkIndex]))
+  );
+}
+
+export async function getLibraryOverview() {
+  return withTransaction(["chapters", "chunks", "audioChunks"], "readonly", async ({ chapters, chunks, audioChunks }) => {
+    const chapterRecords = await promisifyRequest(chapters.getAll());
+    return Promise.all(
+      chapterRecords.map(async (chapter) => {
+        const [chunkRecords, audioRecords] = await Promise.all([
+          promisifyRequest(chunks.index("chapterId").getAll(chapter.chapterId)),
+          promisifyRequest(audioChunks.index("chapterId").getAll(chapter.chapterId))
+        ]);
+        return {
+          chapterId: chapter.chapterId,
+          storyId: chapter.storyId || null,
+          title: chapter.title || "",
+          sourceUrl: chapter.sourceUrl || "",
+          createdAt: chapter.createdAt || 0,
+          chunkCount: chunkRecords.length,
+          readyAudioCount: audioRecords.length,
+          failedCount: chunkRecords.filter((chunk) => chunk.status === "failed").length,
+          sizeBytes: audioRecords.reduce((total, record) => total + (record.sizeBytes || record.blob?.size || 0), 0)
+        };
+      })
+    );
+  });
+}
+
+export async function getChapterIdsByStory(storyId) {
+  return withTransaction(["chapters"], "readonly", ({ chapters }) =>
+    promisifyRequest(chapters.index("storyId").getAllKeys(storyId))
   );
 }
 

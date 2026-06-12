@@ -1,6 +1,8 @@
 export const DB_NAME = "readaloud_mvp";
 export const DB_VERSION = 1;
-export const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+// Downloaded audio stays until the user deletes it from the library; the TTL
+// is only a safety net against unbounded growth from abandoned chapters.
+export const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 export const MAX_CHARS = 600;
 export const MAX_CHUNK_CHARS = 1000;
 export const STREAM_LOOKAHEAD_DEPTH = 2;

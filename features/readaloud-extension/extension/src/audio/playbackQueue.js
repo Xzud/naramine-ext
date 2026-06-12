@@ -1,10 +1,12 @@
 import {
+  CACHE_TTL_MS,
   DEFAULT_CHAPTER_ID,
   DEFAULT_PROVIDER_MODE,
   DEFAULT_STORY_ID,
   DEFAULT_VOICE,
   STREAM_LOOKAHEAD_DEPTH
 } from "../shared/constants.js";
+import { groupLibraryByStory } from "../shared/libraryState.js";
 import { chunkText, stableHash } from "../text/chunkText.js";
 import {
   cleanupExpiredAudio,
@@ -12,8 +14,10 @@ import {
   getAudioChunksByChapter,
   getCacheStatus,
   getChapter,
+  getChapterIdsByStory,
   getChunkByIndex,
   getChunksByChapter,
+  getLibraryOverview,
   saveAudioChunk,
   saveChunks,
   replaceChapterData,
@@ -425,7 +429,7 @@ export class PlaybackQueue {
       sourceUrl: session.sourceUrl || "",
       textHash: stableHash(session.text),
       createdAt: chapter?.createdAt || Date.now(),
-      expiresAt: Date.now() + 24 * 60 * 60 * 1000
+      expiresAt: Date.now() + CACHE_TTL_MS
     };
 
     await this.saveChapterRecord(chapterRecord);
@@ -858,8 +862,9 @@ export class PlaybackQueue {
     return true;
   }
 
-  // Drops everything owned by a finished chapter: its tab, its cached chunk
-  // and audio records, and its persisted session.
+  // Drops the live resources owned by a finished chapter: its tab and its
+  // persisted session. Cached chunk and audio records stay in IndexedDB so
+  // the chapter remains in the downloads library until the user deletes it.
   async cleanupChapter(chapterId, tabId = null, { keepTabId = null } = {}) {
     if (typeof this.tabsApi?.remove === "function" && typeof tabId === "number" && tabId !== keepTabId) {
       try {
@@ -872,13 +877,67 @@ export class PlaybackQueue {
     if (!chapterId) {
       return;
     }
-    await this.deleteChapterRecords(chapterId).catch(() => {});
     await this.deleteSession(chapterId).catch(() => {});
     this.log("chapter_cleaned_up", {}, { chapterId, tabId });
   }
 
   async deleteChapterRecords(chapterId) {
     return deleteChapterData(chapterId);
+  }
+
+  async getLibraryOverviewRecords() {
+    return getLibraryOverview();
+  }
+
+  async getChapterIdsForStory(storyId) {
+    return getChapterIdsByStory(storyId);
+  }
+
+  async getLibrary() {
+    const [overview, activeChapterId] = await Promise.all([
+      this.getLibraryOverviewRecords(),
+      this.getActiveChapterId()
+    ]);
+    return {
+      ok: true,
+      stories: groupLibraryByStory(overview, {
+        warmingChapterIds: [...this.activeWarmups.keys()],
+        activeChapterId
+      })
+    };
+  }
+
+  async deleteDownloadedChapter(chapterId) {
+    await this.runExclusive(() => this.deleteDownloadedChapterExclusive(chapterId));
+    return this.getLibrary();
+  }
+
+  // Deleting the session first starves the warming pipeline (it reloads the
+  // session before every chunk), so an in-flight warmup stops on its own.
+  async deleteDownloadedChapterExclusive(chapterId) {
+    if (!chapterId) {
+      return;
+    }
+
+    const [session, activeChapterId] = await Promise.all([this.loadSession(chapterId), this.getActiveChapterId()]);
+    if (session && !session.stopped && chapterId === activeChapterId) {
+      await this.stopOffscreenPlayback();
+    }
+    await this.deleteSession(chapterId).catch(() => {});
+    await this.deleteChapterRecords(chapterId);
+    this.log("downloaded_chapter_deleted", {}, { chapterId });
+  }
+
+  async deleteDownloadedStory(storyId) {
+    if (storyId) {
+      await this.runExclusive(async () => {
+        const chapterIds = await this.getChapterIdsForStory(storyId);
+        for (const chapterId of chapterIds) {
+          await this.deleteDownloadedChapterExclusive(chapterId);
+        }
+      });
+    }
+    return this.getLibrary();
   }
 
   async deleteSession(chapterId) {

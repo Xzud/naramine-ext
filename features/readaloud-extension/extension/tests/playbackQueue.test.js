@@ -2188,7 +2188,8 @@ test("chapter end advances to the warmed chapter, queues the one after it, and c
   assert.ok(queue.startedStreams.includes("222"));
 
   assert.ok(queue.removedTabs.includes(5));
-  assert.deepEqual(queue.deletedChapterRecords, ["chapter-1"]);
+  // Finished chapters keep their cached audio for the downloads library.
+  assert.deepEqual(queue.deletedChapterRecords, []);
   assert.equal(await queue.loadSession("chapter-1"), null);
 
   // The new chapter's own next part is opened in the background.
@@ -2249,7 +2250,8 @@ test("chapter end without a prefetched tab opens the next chapter directly and p
   assert.equal(nextSession.playRequested, true);
   assert.ok(queue.startedStreams.includes("222"));
   assert.ok(queue.removedTabs.includes(5));
-  assert.deepEqual(queue.deletedChapterRecords, ["chapter-1"]);
+  // Finished chapters keep their cached audio for the downloads library.
+  assert.deepEqual(queue.deletedChapterRecords, []);
 });
 
 test("closing the prefetched tab clears the handoff record", async () => {

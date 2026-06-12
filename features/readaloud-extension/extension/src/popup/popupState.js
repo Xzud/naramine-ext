@@ -52,6 +52,56 @@ export function getChapterRatio(state) {
   return Math.min(state.currentChunkIndex + 1, state.totalChunks) / state.totalChunks;
 }
 
+const LIBRARY_STATUS_LABELS = {
+  downloaded: "Downloaded",
+  processing: "Processing",
+  paused: "Paused"
+};
+
+export function formatBytes(bytes) {
+  const safeBytes = Math.max(0, bytes || 0);
+  if (safeBytes === 0) {
+    return "0 KB";
+  }
+  const megabytes = safeBytes / (1024 * 1024);
+  if (megabytes >= 1024) {
+    return `${(megabytes / 1024).toFixed(1)} GB`;
+  }
+  if (megabytes >= 1) {
+    return `${megabytes.toFixed(1)} MB`;
+  }
+  return `${Math.max(1, Math.round(safeBytes / 1024))} KB`;
+}
+
+function buildChapterMeta(chapter) {
+  const size = formatBytes(chapter.sizeBytes);
+  if (chapter.status === "downloaded") {
+    return size;
+  }
+  const percent = chapter.chunkCount > 0 ? Math.floor((chapter.readyAudioCount / chapter.chunkCount) * 100) : 0;
+  return `${Math.min(99, percent)}% downloaded · ${size}`;
+}
+
+export function buildLibraryViewModel(library) {
+  const stories = Array.isArray(library?.stories) ? library.stories : [];
+  return {
+    empty: stories.length === 0,
+    stories: stories.map((story) => ({
+      storyId: story.storyId,
+      title: story.title || "Unknown story",
+      summary: `${story.downloadedCount} of ${story.chapterCount} chapter${story.chapterCount === 1 ? "" : "s"} downloaded · ${formatBytes(story.sizeBytes)}`,
+      chapters: story.chapters.map((chapter) => ({
+        chapterId: chapter.chapterId,
+        title: chapter.title || "Untitled chapter",
+        status: chapter.status,
+        statusLabel: LIBRARY_STATUS_LABELS[chapter.status] || chapter.status,
+        isActive: Boolean(chapter.isActive),
+        meta: buildChapterMeta(chapter)
+      }))
+    }))
+  };
+}
+
 export function buildPopupViewModel(state, now = Date.now()) {
   const available = Boolean(state?.stateAvailable);
 
