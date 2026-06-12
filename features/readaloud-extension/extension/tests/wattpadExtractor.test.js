@@ -5,7 +5,8 @@ import fs from "node:fs";
 import {
   extractWattpadDomFromHtml,
   extractWattpadEmbeddedStoryTextFromHtml,
-  extractWattpadTextFromHtmlPage
+  extractWattpadTextFromHtmlPage,
+  findNextPartFromHtml
 } from "../src/content/wattpadExtractor.js";
 
 const sampleHtml = fs.readFileSync(new URL("../../../../prompts/sample.html", import.meta.url), "utf8");
@@ -54,6 +55,31 @@ test("direct DOM strategy strips comment widgets from paragraph text", () => {
   assert.equal(result.ok, true);
   assert.equal(result.text.includes("num-comment"), false);
   assert.equal(result.text.includes("comment-marker"), false);
+});
+
+test("resolves the next chapter from embedded nextPart metadata", () => {
+  const result = extractWattpadTextFromHtmlPage(sampleHtml, sampleMetadata);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.nextPart?.partId, "1410454108");
+  assert.ok(result.nextPart.url.includes("/1410454108-"));
+  assert.equal(result.nextPart.title, "~ Chapter 2 ~");
+});
+
+test("falls back to table-of-contents links when embedded nextPart metadata is missing", () => {
+  const htmlWithoutNextPart = sampleHtml.replace(/"nextPart":\{/gi, '"nextPartRemoved":{');
+  const nextPart = findNextPartFromHtml(htmlWithoutNextPart, "1407678433");
+
+  assert.ok(nextPart);
+  assert.equal(nextPart.partId, "1410454108");
+  assert.ok(nextPart.url.includes("/1410454108-"));
+});
+
+test("returns null when no next chapter can be resolved", () => {
+  const htmlWithoutNextPart = sampleHtml.replace(/"nextPart":\{/gi, '"nextPartRemoved":{');
+
+  assert.equal(findNextPartFromHtml(htmlWithoutNextPart, "999999999"), null);
+  assert.equal(findNextPartFromHtml("<html><body>plain page</body></html>", "123"), null);
 });
 
 test("embedded storyText strategy can be exercised independently", () => {

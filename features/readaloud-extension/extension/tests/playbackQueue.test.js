@@ -52,17 +52,51 @@ class TestPlaybackQueue extends PlaybackQueue {
         return { ok: true };
       }
     };
+    const createdTabs = [];
+    const updatedTabs = [];
+    const removedTabs = [];
+    const tabRegistry = new Set();
+    let nextTabId = 900;
     const tabsApi = options.tabsApi || {
       async sendMessage(tabId, message) {
         tabMessages.push({ tabId, message });
+        if (options.onTabMessage) {
+          return options.onTabMessage(tabId, message);
+        }
         return { ok: true };
       },
       async query() {
         return queriedTabs;
+      },
+      async create(createProperties) {
+        const tab = { id: nextTabId, ...createProperties };
+        nextTabId += 1;
+        tabRegistry.add(tab.id);
+        createdTabs.push(tab);
+        return tab;
+      },
+      async update(tabId, updateProperties) {
+        updatedTabs.push({ tabId, ...updateProperties });
+        return { id: tabId };
+      },
+      async remove(tabId) {
+        tabRegistry.delete(tabId);
+        removedTabs.push(tabId);
+      },
+      async get(tabId) {
+        if (!tabRegistry.has(tabId)) {
+          throw new Error(`No tab with id ${tabId}`);
+        }
+        return { id: tabId };
       }
     };
     const storageArea = options.storageArea || new MemoryStorageArea();
     super(runtimeApi, storageArea, tabsApi);
+    this.createdTabs = createdTabs;
+    this.updatedTabs = updatedTabs;
+    this.removedTabs = removedTabs;
+    this.tabRegistry = tabRegistry;
+    this.deletedChapterRecords = [];
     this.cacheSnapshot = options.cacheSnapshot || {
       chunkCount: 0,
       readyAudioCount: 0,
@@ -81,6 +115,10 @@ class TestPlaybackQueue extends PlaybackQueue {
   }
 
   async cleanupExpiredAudioRecords() {}
+
+  async deleteChapterRecords(chapterId) {
+    this.deletedChapterRecords.push(chapterId);
+  }
 
   async ensureOffscreenDocument() {}
 
@@ -2039,4 +2077,198 @@ test("a stale started event from the previous chunk does not override a paragrap
   assert.equal(session.currentChunkId, "chapter-stale-start:5:h6");
   assert.equal(session.playbackStatus, "dispatching");
   assert.equal(session.streamStatus, "connecting");
+});
+
+function buildNextChapterExtraction(partId, nextPart = null) {
+  return {
+    ok: true,
+    text: `Chapter ${partId} body text that is long enough to play through the queue.`,
+    paragraphs: [],
+    title: `Chapter ${partId}`,
+    sourceUrl: `https://www.wattpad.com/${partId}-chapter`,
+    storyId: "story-prefetch",
+    partId,
+    strategy: "dom-paragraphs",
+    confidence: "high",
+    nextPart
+  };
+}
+
+test("playback opens the next chapter in a background tab and warms it without changing the active chapter", async () => {
+  const queue = new TestPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_EXTRACT_TEXT") {
+        return buildNextChapterExtraction("222", {
+          partId: "333",
+          url: "https://www.wattpad.com/333-chapter",
+          title: "Chapter 3"
+        });
+      }
+      return { ok: true };
+    }
+  });
+
+  await queue.setActiveChapterId("chapter-1");
+  const session = buildPlayingSession("chapter-1", {
+    tabId: 5,
+    nextPartId: "222",
+    nextPartUrl: "https://www.wattpad.com/222-chapter"
+  });
+  await queue.saveSession(session);
+  queue.tabRegistry.add(5);
+
+  await queue.ensureNextChapterPrefetch(session);
+  await queue.ensureNextChapterPrefetch(session);
+
+  assert.equal(queue.createdTabs.length, 1);
+  assert.equal(queue.createdTabs[0].active, false);
+  assert.equal(queue.createdTabs[0].url, "https://www.wattpad.com/222-chapter");
+
+  const openingRecord = await queue.loadPrefetchRecord();
+  assert.equal(openingRecord.status, "opening");
+  assert.equal(openingRecord.fromChapterId, "chapter-1");
+
+  await queue.handlePrefetchTabUpdated(queue.createdTabs[0].id, { status: "complete" });
+
+  const readyRecord = await queue.loadPrefetchRecord();
+  assert.equal(readyRecord.status, "ready");
+  assert.equal(readyRecord.nextChapterId, "222");
+
+  const warmedSession = await queue.loadSession("222");
+  assert.equal(warmedSession.playRequested, false);
+  assert.equal(warmedSession.state, "startup_ready");
+  assert.equal(warmedSession.nextPartUrl, "https://www.wattpad.com/333-chapter");
+  assert.equal(await queue.getActiveChapterId(), "chapter-1");
+});
+
+test("chapter end advances to the warmed chapter, queues the one after it, and cleans up the finished chapter", async () => {
+  const queue = new TestPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_EXTRACT_TEXT") {
+        return buildNextChapterExtraction("222", {
+          partId: "333",
+          url: "https://www.wattpad.com/333-chapter",
+          title: "Chapter 3"
+        });
+      }
+      return { ok: true };
+    }
+  });
+
+  await queue.setActiveChapterId("chapter-1");
+  const session = buildPlayingSession("chapter-1", {
+    tabId: 5,
+    currentChunkIndex: 2,
+    currentChunkId: "chapter-1:2:h3",
+    totalChunks: 3,
+    playbackAttemptId: "chapter-1:attempt:3",
+    nextPartId: "222",
+    nextPartUrl: "https://www.wattpad.com/222-chapter"
+  });
+  await queue.saveSession(session);
+  queue.tabRegistry.add(5);
+
+  await queue.ensureNextChapterPrefetch(session);
+  const prefetchTabId = queue.createdTabs[0].id;
+  await queue.handlePrefetchTabUpdated(prefetchTabId, { status: "complete" });
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_ENDED",
+    chapterId: "chapter-1",
+    chunkId: "chapter-1:2:h3",
+    attemptId: "chapter-1:attempt:3"
+  });
+
+  assert.ok(queue.updatedTabs.some((update) => update.tabId === prefetchTabId && update.active === true));
+  assert.equal(await queue.getActiveChapterId(), "222");
+
+  const nextSession = await queue.loadSession("222");
+  assert.equal(nextSession.playRequested, true);
+  assert.equal(nextSession.tabId, prefetchTabId);
+  assert.ok(queue.startedStreams.includes("222"));
+
+  assert.ok(queue.removedTabs.includes(5));
+  assert.deepEqual(queue.deletedChapterRecords, ["chapter-1"]);
+  assert.equal(await queue.loadSession("chapter-1"), null);
+
+  // The new chapter's own next part is opened in the background.
+  if (queue.nextChapterPrefetchTask) {
+    await queue.nextChapterPrefetchTask;
+  }
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  if (queue.nextChapterPrefetchTask) {
+    await queue.nextChapterPrefetchTask;
+  }
+  const followOnTab = queue.createdTabs.find((tab) => tab.url === "https://www.wattpad.com/333-chapter");
+  assert.ok(followOnTab);
+  assert.equal(followOnTab.active, false);
+  const followOnRecord = await queue.loadPrefetchRecord();
+  assert.equal(followOnRecord.fromChapterId, "222");
+});
+
+test("chapter end without a prefetched tab opens the next chapter directly and plays once warmed", async () => {
+  const queue = new TestPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_EXTRACT_TEXT") {
+        return buildNextChapterExtraction("222", null);
+      }
+      return { ok: true };
+    }
+  });
+
+  await queue.setActiveChapterId("chapter-1");
+  const session = buildPlayingSession("chapter-1", {
+    tabId: 5,
+    currentChunkIndex: 2,
+    currentChunkId: "chapter-1:2:h3",
+    totalChunks: 3,
+    playbackAttemptId: "chapter-1:attempt:3",
+    nextPartId: "222",
+    nextPartUrl: "https://www.wattpad.com/222-chapter"
+  });
+  await queue.saveSession(session);
+  queue.tabRegistry.add(5);
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_ENDED",
+    chapterId: "chapter-1",
+    chunkId: "chapter-1:2:h3",
+    attemptId: "chapter-1:attempt:3"
+  });
+
+  assert.equal(queue.createdTabs.length, 1);
+  assert.equal(queue.createdTabs[0].active, true);
+  const record = await queue.loadPrefetchRecord();
+  assert.equal(record.playOnReady, true);
+  assert.equal(record.status, "opening");
+
+  await queue.handlePrefetchTabUpdated(queue.createdTabs[0].id, { status: "complete" });
+
+  assert.equal(await queue.getActiveChapterId(), "222");
+  const nextSession = await queue.loadSession("222");
+  assert.equal(nextSession.playRequested, true);
+  assert.ok(queue.startedStreams.includes("222"));
+  assert.ok(queue.removedTabs.includes(5));
+  assert.deepEqual(queue.deletedChapterRecords, ["chapter-1"]);
+});
+
+test("closing the prefetched tab clears the handoff record", async () => {
+  const queue = new TestPlaybackQueue();
+
+  await queue.setActiveChapterId("chapter-1");
+  const session = buildPlayingSession("chapter-1", {
+    tabId: 5,
+    nextPartId: "222",
+    nextPartUrl: "https://www.wattpad.com/222-chapter"
+  });
+  await queue.saveSession(session);
+
+  await queue.ensureNextChapterPrefetch(session);
+  const prefetchTabId = queue.createdTabs[0].id;
+  assert.ok(await queue.loadPrefetchRecord());
+
+  queue.tabRegistry.delete(prefetchTabId);
+  await queue.handlePrefetchTabRemoved(prefetchTabId);
+
+  assert.equal(await queue.loadPrefetchRecord(), null);
 });

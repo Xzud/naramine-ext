@@ -8,6 +8,7 @@ import {
 import { chunkText, stableHash } from "../text/chunkText.js";
 import {
   cleanupExpiredAudio,
+  deleteChapterData,
   getAudioChunksByChapter,
   getCacheStatus,
   getChapter,
@@ -37,7 +38,10 @@ import {
 
 const SESSION_PREFIX = "readaloud:session:";
 const ACTIVE_CHAPTER_KEY = "readaloud:activeChapterId";
+const NEXT_CHAPTER_PREFETCH_KEY = "readaloud:nextChapterPrefetch";
 const CHAPTER_REFRESH_LOOKAHEAD = 3;
+const PREFETCH_EXTRACT_ATTEMPTS = 6;
+const PREFETCH_EXTRACT_RETRY_MS = 1000;
 const PLAYBACK_RUNTIME_EVENTS = new Set([
   "CHUNK_PLAYBACK_STARTED",
   "CHUNK_PLAYBACK_ENDED",
@@ -58,7 +62,9 @@ export class PlaybackQueue {
     this.storageArea = storageArea;
     this.tabsApi = tabsApi;
     this.sessionTaskChain = Promise.resolve();
+    this.prefetchTaskChain = Promise.resolve();
     this.activeWarmups = new Map();
+    this.nextChapterPrefetchTask = null;
     this.runtimeApi.onMessage.addListener((message) => {
       if (!PLAYBACK_RUNTIME_EVENTS.has(message?.type)) {
         return undefined;
@@ -66,6 +72,12 @@ export class PlaybackQueue {
 
       void this.handleRuntimeMessage(message);
       return undefined;
+    });
+    this.tabsApi?.onUpdated?.addListener?.((tabId, changeInfo) => {
+      void this.handlePrefetchTabUpdated(tabId, changeInfo).catch(() => {});
+    });
+    this.tabsApi?.onRemoved?.addListener?.((tabId) => {
+      void this.handlePrefetchTabRemoved(tabId).catch(() => {});
     });
   }
 
@@ -76,6 +88,20 @@ export class PlaybackQueue {
   runExclusive(task) {
     const result = this.sessionTaskChain.then(() => task());
     this.sessionTaskChain = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
+  }
+
+  // The next-chapter prefetch record is mutated from independent signals (tab
+  // load events, chapter-end advance, tab removal). Serializing those writes
+  // keeps a "play when ready" flag from being lost to a concurrent
+  // ready-status write. Separate from the session lock because prefetch work
+  // runs inside session-exclusive sections.
+  runPrefetchExclusive(task) {
+    const result = this.prefetchTaskChain.then(() => task());
+    this.prefetchTaskChain = result.then(
       () => undefined,
       () => undefined
     );
@@ -503,6 +529,9 @@ export class PlaybackQueue {
       extractionStrategy: response.strategy || latestSession.extractionStrategy,
       extractionConfidence: response.confidence || latestSession.extractionConfidence,
       partId: response.partId || latestSession.partId,
+      nextPartId: response.nextPart?.partId || latestSession.nextPartId || null,
+      nextPartUrl: response.nextPart?.url || latestSession.nextPartUrl || null,
+      nextPartTitle: response.nextPart?.title || latestSession.nextPartTitle || null,
       playRequested: Boolean(latestSession.playRequested)
     };
 
@@ -522,6 +551,342 @@ export class PlaybackQueue {
       await this.processSession(refreshedSession.chapterId);
     }
     return true;
+  }
+
+  async loadPrefetchRecord() {
+    const values = await this.storageArea.get(NEXT_CHAPTER_PREFETCH_KEY);
+    return values[NEXT_CHAPTER_PREFETCH_KEY] || null;
+  }
+
+  async savePrefetchRecord(record) {
+    await this.storageArea.set({ [NEXT_CHAPTER_PREFETCH_KEY]: record });
+  }
+
+  async clearPrefetchRecord() {
+    if (typeof this.storageArea.remove === "function") {
+      await this.storageArea.remove(NEXT_CHAPTER_PREFETCH_KEY);
+      return;
+    }
+    await this.storageArea.set({ [NEXT_CHAPTER_PREFETCH_KEY]: null });
+  }
+
+  async prefetchTabExists(tabId) {
+    if (typeof tabId !== "number") {
+      return false;
+    }
+    if (typeof this.tabsApi?.get !== "function") {
+      return true;
+    }
+    try {
+      return Boolean(await this.tabsApi.get(tabId));
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  // Opens the playing chapter's next part in a background tab so its DOM can
+  // be scanned and its audio warmed before the current chapter finishes.
+  // Single-flight plus the stored record keep repeated chunk-advance signals
+  // from opening duplicate tabs.
+  ensureNextChapterPrefetch(session) {
+    if (this.nextChapterPrefetchTask) {
+      return this.nextChapterPrefetchTask;
+    }
+    const task = this.openNextChapterPrefetch(session)
+      .catch(() => false)
+      .finally(() => {
+        this.nextChapterPrefetchTask = null;
+      });
+    this.nextChapterPrefetchTask = task;
+    return task;
+  }
+
+  async openNextChapterPrefetch(session, { active = false, playOnReady = false } = {}) {
+    if (!session?.nextPartUrl || typeof this.tabsApi?.create !== "function") {
+      return false;
+    }
+    if (session.stopped || session.state === "error") {
+      return false;
+    }
+    if (session.nextPartId && String(session.nextPartId) === String(session.chapterId)) {
+      return false;
+    }
+
+    return this.runPrefetchExclusive(async () => {
+      const record = await this.loadPrefetchRecord();
+      if (record && record.fromChapterId === session.chapterId && record.url === session.nextPartUrl) {
+        if (record.status === "failed") {
+          return false;
+        }
+        if (await this.prefetchTabExists(record.tabId)) {
+          return true;
+        }
+      }
+
+      const tab = await this.tabsApi.create({ url: session.nextPartUrl, active });
+      await this.savePrefetchRecord({
+        fromChapterId: session.chapterId,
+        fromTabId: typeof session.tabId === "number" ? session.tabId : null,
+        nextChapterId: session.nextPartId || null,
+        url: session.nextPartUrl,
+        tabId: tab?.id ?? null,
+        status: "opening",
+        playOnReady,
+        createdAt: Date.now()
+      });
+      this.log("next_chapter_prefetch_opened", session, {
+        url: session.nextPartUrl,
+        tabId: tab?.id ?? null,
+        active
+      });
+      return true;
+    });
+  }
+
+  async handlePrefetchTabUpdated(tabId, changeInfo) {
+    if (changeInfo?.status !== "complete") {
+      return;
+    }
+
+    const claimedRecord = await this.runPrefetchExclusive(async () => {
+      const record = await this.loadPrefetchRecord();
+      if (!record || record.tabId !== tabId || record.status !== "opening") {
+        return null;
+      }
+      const warmingRecord = { ...record, status: "warming" };
+      await this.savePrefetchRecord(warmingRecord);
+      return warmingRecord;
+    });
+
+    if (claimedRecord) {
+      await this.processPrefetchedTab(claimedRecord);
+    }
+  }
+
+  async handlePrefetchTabRemoved(tabId) {
+    await this.runPrefetchExclusive(async () => {
+      const record = await this.loadPrefetchRecord();
+      if (record && record.tabId === tabId) {
+        await this.clearPrefetchRecord();
+      }
+    });
+  }
+
+  // The prefetched page hydrates after the tab reports complete, so the
+  // first extraction attempts may come back empty; retry briefly.
+  async extractFromTabWithRetry(tabId, attempts = PREFETCH_EXTRACT_ATTEMPTS, delayMs = PREFETCH_EXTRACT_RETRY_MS) {
+    let extraction = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      extraction = await this.sendPageCommand(tabId, { type: "READALOUD_EXTRACT_TEXT" });
+      if (extraction?.ok && extraction.text) {
+        return extraction;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    return extraction;
+  }
+
+  // Scans the background tab's DOM, stores a warm (non-active) session for
+  // the next chapter, and starts synthesizing its audio cache. The active
+  // chapter pointer is untouched until the current chapter actually ends.
+  async processPrefetchedTab(record) {
+    const extraction = await this.extractFromTabWithRetry(record.tabId);
+    if (!extraction?.ok || !extraction.text) {
+      await this.runPrefetchExclusive(async () => {
+        const latest = await this.loadPrefetchRecord();
+        if (latest && latest.tabId === record.tabId) {
+          await this.savePrefetchRecord({
+            ...latest,
+            status: "failed",
+            error: extraction?.error || "prefetch_extract_failed"
+          });
+        }
+      });
+      this.log("next_chapter_prefetch_extract_failed", {}, {
+        tabId: record.tabId,
+        error: extraction?.error || null
+      });
+      return;
+    }
+
+    const chapterId = await this.warmupPrefetchedChapter(record, extraction);
+    if (!chapterId) {
+      return;
+    }
+
+    const readyRecord = await this.runPrefetchExclusive(async () => {
+      const latest = await this.loadPrefetchRecord();
+      if (!latest || latest.tabId !== record.tabId) {
+        return null;
+      }
+      const nextRecord = { ...latest, nextChapterId: chapterId, status: "ready" };
+      await this.savePrefetchRecord(nextRecord);
+      return nextRecord;
+    });
+    if (!readyRecord) {
+      return;
+    }
+
+    this.log("next_chapter_prefetch_ready", {}, { chapterId, tabId: record.tabId });
+    void this.ensureWarmingPipeline(chapterId);
+    if (readyRecord.playOnReady) {
+      await this.activatePrefetchedChapter(readyRecord);
+    }
+  }
+
+  async warmupPrefetchedChapter(record, extraction) {
+    return this.runExclusive(async () => {
+      const playbackInput = await this.resolvePlaybackInput({ ...extraction, tabId: record.tabId });
+      if (!playbackInput.ok) {
+        return null;
+      }
+
+      const chapterId = playbackInput.chapterId;
+      const existingSession = await this.loadSession(chapterId);
+      const session =
+        existingSession && existingSession.text === playbackInput.text && existingSession.state !== "error"
+          ? { ...existingSession, tabId: record.tabId }
+          : this.createSessionFromInput(playbackInput, {
+              playRequested: false,
+              state: "startup_ready",
+              lastEvent: "next_chapter_prefetched"
+            });
+      await this.ensureChapterData(session);
+      await this.saveSession(session);
+      return chapterId;
+    });
+  }
+
+  // Moves playback onto the prefetched chapter once the current one finishes.
+  // If the warm tab is still loading, mark it play-on-ready and surface it;
+  // if there is no prefetch at all, open the next part directly.
+  async advanceToNextChapter(endedSession) {
+    if (!endedSession?.chapterId) {
+      return false;
+    }
+
+    const decision = await this.runPrefetchExclusive(async () => {
+      const record = await this.loadPrefetchRecord();
+      if (
+        !record ||
+        record.fromChapterId !== endedSession.chapterId ||
+        !(await this.prefetchTabExists(record.tabId))
+      ) {
+        return { action: "open_directly" };
+      }
+
+      const mergedRecord = {
+        ...record,
+        fromTabId: typeof record.fromTabId === "number" ? record.fromTabId : endedSession.tabId ?? null
+      };
+      if (record.status === "ready" && record.nextChapterId) {
+        await this.savePrefetchRecord(mergedRecord);
+        return { action: "activate", record: mergedRecord };
+      }
+      if (record.status === "opening" || record.status === "warming") {
+        await this.savePrefetchRecord({ ...mergedRecord, playOnReady: true });
+        return { action: "wait", record: mergedRecord };
+      }
+      return { action: "open_directly" };
+    });
+
+    if (decision.action === "activate") {
+      return this.activatePrefetchedChapter(decision.record);
+    }
+
+    if (decision.action === "wait") {
+      if (typeof this.tabsApi?.update === "function" && typeof decision.record.tabId === "number") {
+        try {
+          await this.tabsApi.update(decision.record.tabId, { active: true });
+        } catch (_error) {
+          // The tab may have been closed between the existence check and now.
+        }
+      }
+      this.log("auto_advance_waiting_for_prefetch", endedSession, { tabId: decision.record.tabId });
+      return true;
+    }
+
+    if (!endedSession.nextPartUrl) {
+      this.log("auto_advance_no_next_chapter", endedSession);
+      return false;
+    }
+
+    return this.openNextChapterPrefetch(endedSession, { active: true, playOnReady: true });
+  }
+
+  async activatePrefetchedChapter(record) {
+    if (!record?.nextChapterId) {
+      return false;
+    }
+
+    await this.runPrefetchExclusive(() => this.clearPrefetchRecord());
+
+    if (typeof this.tabsApi?.update === "function" && typeof record.tabId === "number") {
+      try {
+        await this.tabsApi.update(record.tabId, { active: true });
+      } catch (_error) {
+        // Keep going; playback does not require the tab to be focused.
+      }
+    }
+
+    await this.setActiveChapterId(record.nextChapterId);
+    await this.runExclusive(async () => {
+      const session = await this.loadSession(record.nextChapterId);
+      if (!session?.text || session.state === "error") {
+        return;
+      }
+      const startedSession = {
+        ...session,
+        tabId: typeof record.tabId === "number" ? record.tabId : session.tabId || null,
+        paused: false,
+        stopped: false,
+        playRequested: true,
+        state: "playback_starting",
+        playbackStatus: "idle",
+        streamStatus: "idle",
+        lastEvent: "auto_advanced_to_next_chapter",
+        errorMessage: null
+      };
+      await this.saveSession(startedSession);
+      await this.ensureOffscreenDocument();
+      await this.processSession(record.nextChapterId);
+    });
+
+    this.log("auto_advance_started", {}, { chapterId: record.nextChapterId, tabId: record.tabId });
+
+    await this.cleanupChapter(record.fromChapterId, record.fromTabId, { keepTabId: record.tabId });
+    return true;
+  }
+
+  // Drops everything owned by a finished chapter: its tab, its cached chunk
+  // and audio records, and its persisted session.
+  async cleanupChapter(chapterId, tabId = null, { keepTabId = null } = {}) {
+    if (typeof this.tabsApi?.remove === "function" && typeof tabId === "number" && tabId !== keepTabId) {
+      try {
+        await this.tabsApi.remove(tabId);
+      } catch (_error) {
+        // The user may have already closed it.
+      }
+    }
+
+    if (!chapterId) {
+      return;
+    }
+    await this.deleteChapterRecords(chapterId).catch(() => {});
+    await this.deleteSession(chapterId).catch(() => {});
+    this.log("chapter_cleaned_up", {}, { chapterId, tabId });
+  }
+
+  async deleteChapterRecords(chapterId) {
+    return deleteChapterData(chapterId);
+  }
+
+  async deleteSession(chapterId) {
+    if (typeof this.storageArea.remove === "function") {
+      await this.storageArea.remove(this.getSessionKey(chapterId));
+      return;
+    }
+    await this.storageArea.set({ [this.getSessionKey(chapterId)]: null });
   }
 
   async playFromParagraph(options = {}) {
@@ -806,6 +1171,9 @@ export class PlaybackQueue {
       title: playbackInput.title || "Wattpad Chapter",
       sourceUrl: playbackInput.sourceUrl || "",
       partId: playbackInput.partId || chapterId,
+      nextPartId: playbackInput.nextPart?.partId || null,
+      nextPartUrl: playbackInput.nextPart?.url || null,
+      nextPartTitle: playbackInput.nextPart?.title || null,
       extractionStrategy: playbackInput.extractionStrategy || null,
       extractionConfidence: playbackInput.extractionConfidence || null,
       state: "preparing",
@@ -969,12 +1337,18 @@ export class PlaybackQueue {
     await this.setActiveChapterId(chapterId);
 
     if (existingSession && existingSession.text === playbackInput.text && existingSession.state !== "error") {
+      const nextPartUpgrade = {
+        nextPartId: playbackInput.nextPart?.partId || existingSession.nextPartId || null,
+        nextPartUrl: playbackInput.nextPart?.url || existingSession.nextPartUrl || null,
+        nextPartTitle: playbackInput.nextPart?.title || existingSession.nextPartTitle || null
+      };
       const resumedWarmSession = existingSession.stopped || existingSession.state === "ended"
         ? this.createRestartedSession(existingSession, {
             tabId: playbackInput.tabId || existingSession.tabId || null,
             playRequested: false,
             state: "startup_ready",
-            lastEvent: "session_warmup_resumed"
+            lastEvent: "session_warmup_resumed",
+            ...nextPartUpgrade
           })
         : {
             ...existingSession,
@@ -983,7 +1357,8 @@ export class PlaybackQueue {
             stopped: false,
             playRequested: false,
             state: "startup_ready",
-            lastEvent: "session_warmup_resumed"
+            lastEvent: "session_warmup_resumed",
+            ...nextPartUpgrade
           };
       await this.ensureChapterData(resumedWarmSession);
       await this.saveSession(resumedWarmSession);
@@ -1140,6 +1515,7 @@ export class PlaybackQueue {
     }
 
     void this.ensureWarmingPipeline(chapterId);
+    void this.ensureNextChapterPrefetch(session);
     await this.ensureOffscreenDocument();
     await this.startCurrentChunkStream(chapterId);
   }
@@ -1274,6 +1650,11 @@ export class PlaybackQueue {
     if (followUp?.refreshSession) {
       await this.refreshChapterDataFromPage(followUp.refreshSession, { resumePlayback: true }).catch(() => {});
     }
+    if (followUp?.advanceSession) {
+      await this.advanceToNextChapter(followUp.advanceSession).catch((error) => {
+        this.log("auto_advance_failed", followUp.advanceSession, { error: String(error) });
+      });
+    }
     return followUp;
   }
 
@@ -1367,18 +1748,18 @@ export class PlaybackQueue {
       }
       const advancedSession =
         result.session.state === "ended" ? this.foldPlaybackClock(result.session) : result.session;
-      await this.saveSession({
+      const savedSession = {
         ...advancedSession,
         streamStatus: advancedSession.state === "ended" ? "ended" : "idle",
         bytesReceived: 0,
         bufferedAudioMs: 0
-      });
+      };
+      await this.saveSession(savedSession);
       if (result.session.state === "ended") {
         await this.clearChunkFocus(result.session).catch(() => {});
+        return { advanceSession: savedSession };
       }
-      if (result.session.state !== "ended") {
-        await this.processSession(chapterId);
-      }
+      await this.processSession(chapterId);
       return;
     }
 
@@ -1479,6 +1860,7 @@ export class PlaybackQueue {
         title: options.title || "Wattpad Chapter",
         sourceUrl: options.sourceUrl || "",
         partId: options.partId || options.chapterId || DEFAULT_CHAPTER_ID,
+        nextPart: options.nextPart || null,
         tabId: options.tabId || null,
         pageDetected: options.pageDetected ?? true,
         pageEligible: options.pageEligible ?? true,
@@ -1588,6 +1970,7 @@ export class PlaybackQueue {
       title: extraction.title || "Wattpad Chapter",
       sourceUrl: extraction.sourceUrl || "",
       partId: extraction.partId || chapterId,
+      nextPart: extraction.nextPart || null,
       tabId,
       extractionStrategy: extraction.strategy || "dom-paragraphs",
       extractionConfidence: extraction.confidence || "medium"

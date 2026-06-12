@@ -125,6 +125,15 @@ function deleteChapterScopedData(chunksStore, audioChunksStore, chapterId) {
   ]);
 }
 
+export async function deleteChapterData(chapterId) {
+  return withTransaction(["chapters", "chunks", "audioChunks"], "readwrite", async ({ chapters, chunks, audioChunks }) => {
+    await Promise.all([
+      promisifyRequest(chapters.delete(chapterId)),
+      deleteChapterScopedData(chunks, audioChunks, chapterId)
+    ]);
+  });
+}
+
 export async function replaceChapterData(chapterId, chunkRecords) {
   return withTransaction(["chunks", "audioChunks"], "readwrite", async ({ chunks, audioChunks }) => {
     await deleteChapterScopedData(chunks, audioChunks, chapterId);

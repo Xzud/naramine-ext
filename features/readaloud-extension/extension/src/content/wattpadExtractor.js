@@ -178,6 +178,49 @@ function buildSuccess(paragraphs, metadata, strategy, confidence) {
   };
 }
 
+export function findNextPartFromHtml(value, currentPartId = null) {
+  // Wattpad embeds a "nextPart" object in the page payload; it is the most
+  // reliable source. Only the id/title/url fields near the object start are
+  // read so trailing nested objects cannot confuse the match.
+  const embeddedMatch = value.match(/"nextPart":\{([\s\S]{0,800})/i);
+  if (embeddedMatch) {
+    const body = embeddedMatch[1];
+    const id = body.match(/"id":\s*"?(\d+)"?/i)?.[1] || null;
+    const urlMatch = body.match(/"url":"((?:[^"\\]|\\.)*)"/i);
+    const titleMatch = body.match(/"title":"((?:[^"\\]|\\.)*)"/i);
+    const url = urlMatch ? decodeEscapedJsonString(urlMatch[1]) : null;
+    if (id && url && url.includes(`/${id}-`) && (!currentPartId || id !== String(currentPartId))) {
+      return {
+        partId: id,
+        url,
+        title: titleMatch ? decodeEscapedJsonString(titleMatch[1]) : ""
+      };
+    }
+  }
+
+  // Fall back to the table-of-contents links: find the entry for the current
+  // part and take the next part-shaped href after it.
+  if (currentPartId) {
+    const links = [];
+    for (const match of value.matchAll(/<a\b[^>]*href="(\/(\d+)-[^"]*)"[^>]*>/gi)) {
+      links.push({ href: match[1], partId: match[2] });
+    }
+    const activeIndex = links.findIndex((link) => link.partId === String(currentPartId));
+    if (activeIndex >= 0) {
+      const next = links.slice(activeIndex + 1).find((link) => link.partId !== String(currentPartId));
+      if (next) {
+        return {
+          partId: next.partId,
+          url: `https://www.wattpad.com${decodeHtmlEntities(next.href)}`,
+          title: ""
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
 export function isWattpadReadingPageFromHtml(value, sourceUrl = "") {
   const loweredUrl = sourceUrl.toLowerCase();
   const matchesHost = !sourceUrl || loweredUrl.includes("wattpad.com");
@@ -240,11 +283,13 @@ export function extractWattpadTextFromHtmlPage(value, metadata = {}) {
 
   const domResult = extractWattpadDomFromHtml(value, metadata);
   if (domResult.ok) {
+    domResult.nextPart = findNextPartFromHtml(value, domResult.partId);
     return domResult;
   }
 
   const embeddedResult = extractWattpadEmbeddedStoryTextFromHtml(value, metadata);
   if (embeddedResult.ok) {
+    embeddedResult.nextPart = findNextPartFromHtml(value, embeddedResult.partId);
     return embeddedResult;
   }
 
@@ -305,9 +350,14 @@ export function extractWattpadTextFromDocument(documentRef) {
     );
 
     if (domResult.ok) {
+      domResult.nextPart = findNextPartFromHtml(documentRef.documentElement.outerHTML, domResult.partId);
       return domResult;
     }
   }
 
-  return extractWattpadEmbeddedStoryTextFromHtml(documentRef.documentElement.outerHTML, metadata);
+  const embeddedResult = extractWattpadEmbeddedStoryTextFromHtml(documentRef.documentElement.outerHTML, metadata);
+  if (embeddedResult.ok) {
+    embeddedResult.nextPart = findNextPartFromHtml(documentRef.documentElement.outerHTML, embeddedResult.partId);
+  }
+  return embeddedResult;
 }
