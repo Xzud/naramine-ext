@@ -91,7 +91,23 @@ class TestPlaybackQueue extends PlaybackQueue {
       }
     };
     const storageArea = options.storageArea || new MemoryStorageArea();
-    super(runtimeApi, storageArea, tabsApi);
+    const createdAlarms = [];
+    const clearedAlarms = [];
+    const alarmsApi = options.alarmsApi || {
+      create(name, info) {
+        createdAlarms.push({ name, ...info });
+      },
+      async clear(name) {
+        clearedAlarms.push(name);
+        return true;
+      },
+      onAlarm: {
+        addListener() {}
+      }
+    };
+    super(runtimeApi, storageArea, tabsApi, alarmsApi);
+    this.createdAlarms = createdAlarms;
+    this.clearedAlarms = clearedAlarms;
     this.createdTabs = createdTabs;
     this.updatedTabs = updatedTabs;
     this.removedTabs = removedTabs;
@@ -2839,6 +2855,20 @@ test("isViewingChapterPage rejects a story overview or non-Wattpad page", async 
   assert.equal(await PlaybackQueue.prototype.isViewingChapterPage.call(queue, "222"), false);
 });
 
+test("sync status falls back to the active chapter's story when the page context is unavailable", async () => {
+  // The default tab messaging returns { ok: true } with no page kind, mimicking
+  // a stale content script that cannot answer the page-context probe.
+  const queue = new TestPlaybackQueue();
+  await queue.setActiveChapterId("ch-active");
+  await queue.saveSession(buildWarmSession("ch-active", { storyId: "story-active" }));
+
+  const status = await queue.getSyncStatus({});
+
+  assert.equal(status.ok, true);
+  assert.equal(status.storyId, "story-active");
+  assert.equal(status.enabled, false);
+});
+
 test("recordLastPlayed stores per-story position and bounds the history", async () => {
   const queue = new TestPlaybackQueue();
   for (let index = 0; index < 32; index += 1) {
@@ -3077,4 +3107,134 @@ test("deleting a story clears its last-played record", async () => {
   await queue.deleteDownloadedStory("story-del");
 
   assert.equal(await queue.getLastPlayed("story-del"), null);
+});
+
+test("setSleepTimer for a duration stores the deadline and schedules an alarm", async () => {
+  const queue = new TestPlaybackQueue();
+
+  const status = await queue.setSleepTimer({ mode: "duration", durationMs: 1800000 }, 1000);
+
+  assert.equal(status.mode, "duration");
+  assert.equal(status.deadline, 1801000);
+  assert.equal(status.durationMs, 1800000);
+  assert.equal(queue.createdAlarms.length, 1);
+  assert.equal(queue.createdAlarms[0].name, "readaloud:sleepTimer");
+  assert.equal(queue.createdAlarms[0].when, 1801000);
+});
+
+test("setSleepTimer for end of chapter stores the mode without an alarm", async () => {
+  const queue = new TestPlaybackQueue();
+
+  const status = await queue.setSleepTimer({ mode: "end_of_chapter" });
+
+  assert.equal(status.mode, "end_of_chapter");
+  assert.equal(status.deadline, null);
+  assert.equal(queue.createdAlarms.length, 0);
+});
+
+test("setSleepTimer off clears the stored timer and any alarm", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.setSleepTimer({ mode: "duration", durationMs: 60000 });
+
+  const status = await queue.setSleepTimer({ mode: "off" });
+
+  assert.equal(status.mode, "off");
+  assert.ok(queue.clearedAlarms.includes("readaloud:sleepTimer"));
+  assert.equal((await queue.getSleepTimer()).mode, "off");
+});
+
+test("getSleepTimer reports the remaining duration", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.setSleepTimer({ mode: "duration", durationMs: 60000 }, 1000);
+
+  const status = await queue.getSleepTimer(31000);
+
+  assert.equal(status.remainingMs, 30000);
+});
+
+test("a fired duration alarm pauses the active chapter without advancing or closing tabs", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.setActiveChapterId("chapter-sleep");
+  await queue.saveSession(buildPlayingSession("chapter-sleep"));
+  await queue.saveSleepTimer({ mode: "duration", deadline: Date.now() - 1000, durationMs: 1000 });
+
+  await queue.handleSleepAlarm({ name: "readaloud:sleepTimer" });
+
+  const session = await queue.loadSession("chapter-sleep");
+  assert.equal(session.state, "paused");
+  assert.equal(queue.sentMessages.some((message) => message.type === "PAUSE_PLAYBACK"), true);
+  assert.deepEqual(queue.startedStreams, []);
+  assert.equal(queue.createdTabs.length, 0);
+  assert.deepEqual(queue.removedTabs, []);
+  assert.equal((await queue.getSleepTimer()).mode, "off");
+});
+
+test("a duration timer that elapsed mid-chapter pauses at the next chunk boundary", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.setActiveChapterId("chapter-mid");
+  await queue.saveSession(buildPlayingSession("chapter-mid", { totalChunks: 3 }));
+  await queue.saveSleepTimer({ mode: "duration", deadline: Date.now() - 1000, durationMs: 1000 });
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_ENDED",
+    chapterId: "chapter-mid",
+    chunkId: "chapter-mid:0:h1",
+    attemptId: "chapter-mid:attempt:1"
+  });
+
+  const session = await queue.loadSession("chapter-mid");
+  assert.equal(session.state, "paused");
+  assert.equal(queue.sentMessages.some((message) => message.type === "PAUSE_PLAYBACK"), true);
+  // The next chunk is not started, and nothing is auto-advanced.
+  assert.deepEqual(queue.startedStreams, []);
+  assert.equal((await queue.getSleepTimer()).mode, "off");
+});
+
+test("end-of-chapter timer lets the chapter finish then pauses instead of advancing", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.setActiveChapterId("chapter-eoc");
+  await queue.saveSession(
+    buildPlayingSession("chapter-eoc", {
+      totalChunks: 1,
+      nextPartId: "next-eoc",
+      nextPartUrl: "https://www.wattpad.com/next-eoc"
+    })
+  );
+  await queue.saveSleepTimer({ mode: "end_of_chapter", deadline: null, durationMs: null });
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_ENDED",
+    chapterId: "chapter-eoc",
+    chunkId: "chapter-eoc:0:h1",
+    attemptId: "chapter-eoc:attempt:1"
+  });
+
+  const session = await queue.loadSession("chapter-eoc");
+  assert.equal(session.state, "ended");
+  // No next-chapter tab was opened: auto-advance was suppressed.
+  assert.equal(queue.createdTabs.length, 0);
+  assert.equal((await queue.getSleepTimer()).mode, "off");
+});
+
+test("without a sleep timer a finished chapter still auto-advances", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.setActiveChapterId("chapter-adv");
+  await queue.saveSession(
+    buildPlayingSession("chapter-adv", {
+      totalChunks: 1,
+      tabId: 5,
+      nextPartId: "next-adv",
+      nextPartUrl: "https://www.wattpad.com/next-adv"
+    })
+  );
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_ENDED",
+    chapterId: "chapter-adv",
+    chunkId: "chapter-adv:0:h1",
+    attemptId: "chapter-adv:attempt:1"
+  });
+
+  // The next chapter was opened in a background tab for handoff.
+  assert.ok(queue.createdTabs.some((tab) => tab.url === "https://www.wattpad.com/next-adv"));
 });

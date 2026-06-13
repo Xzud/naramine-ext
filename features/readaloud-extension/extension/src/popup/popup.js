@@ -1,5 +1,5 @@
 import { createUnavailableRuntimeState } from "../audio/runtimeState.js";
-import { buildLibraryViewModel, buildPopupViewModel, isPauseable } from "./popupState.js";
+import { buildLibraryViewModel, buildPopupViewModel, formatTimer, isPauseable } from "./popupState.js";
 
 const PLAY_ICON_PATH =
   '<path d="M8 6.82v10.36c0 .79.87 1.27 1.54.84l8.14-5.18a1 1 0 0 0 0-1.68L9.54 5.98A1 1 0 0 0 8 6.82Z" />';
@@ -14,6 +14,7 @@ let lastLibrarySignature = null;
 let libraryOpen = false;
 let confirmResetTimer = null;
 let syncStatus = null;
+let sleepStatus = null;
 
 async function request(type, payload = {}) {
   try {
@@ -227,6 +228,12 @@ async function handleDeleteClick(button) {
 async function refreshState() {
   lastState = await request("GET_STATE");
   render();
+  // The first sync probe can miss (service worker waking, content script just
+  // loaded); keep retrying on the poll until the story under the toggle
+  // resolves, then stop re-probing the page.
+  if (!syncStatus?.ok) {
+    await refreshSync();
+  }
   if (libraryOpen) {
     await refreshLibrary();
   }
@@ -248,11 +255,56 @@ function renderSyncToggle() {
   document.getElementById("syncLabel").textContent = enabled ? "Sync on" : "Sync off";
 }
 
-// The page (and therefore the story under the toggle) cannot change while
-// the popup stays open, so one fetch at open plus updates on click suffice.
 async function refreshSync() {
   syncStatus = await request("SYNC_GET");
   renderSyncToggle();
+}
+
+function renderSleep() {
+  const button = document.getElementById("sleepToggle");
+  const label = document.getElementById("sleepLabel");
+  if (!button || !label) {
+    return;
+  }
+  const mode = sleepStatus?.mode || "off";
+  button.classList.toggle("active", mode !== "off");
+  button.setAttribute("aria-label", mode === "off" ? "Sleep timer" : "Sleep timer (on)");
+
+  if (mode === "duration" && sleepStatus?.deadline) {
+    label.hidden = false;
+    label.textContent = formatTimer(Math.max(0, sleepStatus.deadline - Date.now()));
+  } else if (mode === "end_of_chapter") {
+    label.hidden = false;
+    label.textContent = "Chapter";
+  } else {
+    label.hidden = true;
+    label.textContent = "";
+  }
+
+  for (const option of document.querySelectorAll(".sleep-option")) {
+    const optionMode = option.dataset.duration ? "duration" : option.dataset.mode;
+    const matches =
+      optionMode === mode &&
+      (mode !== "duration" || Number(option.dataset.duration) === sleepStatus?.durationMs);
+    option.classList.toggle("selected", Boolean(matches));
+  }
+}
+
+// SLEEP_GET only reads stored state (no page round-trip), so polling it on the
+// regular refresh is cheap and keeps the countdown and "fired" state current.
+async function refreshSleep() {
+  sleepStatus = await request("SLEEP_GET");
+  renderSleep();
+}
+
+function setSleepMenuOpen(open) {
+  const menu = document.getElementById("sleepMenu");
+  const button = document.getElementById("sleepToggle");
+  if (!menu || !button) {
+    return;
+  }
+  menu.hidden = !open;
+  button.setAttribute("aria-expanded", String(open));
 }
 
 document.getElementById("play")?.addEventListener("click", async () => {
@@ -280,6 +332,35 @@ document.getElementById("syncToggle")?.addEventListener("click", async () => {
   }
   button.disabled = false;
   renderSyncToggle();
+});
+
+document.getElementById("sleepToggle")?.addEventListener("click", (event) => {
+  event.stopPropagation();
+  setSleepMenuOpen(document.getElementById("sleepMenu")?.hidden !== false);
+});
+
+document.getElementById("sleepMenu")?.addEventListener("click", async (event) => {
+  const option = event.target.closest?.(".sleep-option");
+  if (!option) {
+    return;
+  }
+  const payload = option.dataset.duration
+    ? { mode: "duration", durationMs: Number(option.dataset.duration) }
+    : { mode: option.dataset.mode || "off" };
+  const response = await request("SLEEP_SET", payload);
+  if (response && typeof response.mode === "string") {
+    sleepStatus = response;
+  }
+  setSleepMenuOpen(false);
+  renderSleep();
+});
+
+// Close the sleep menu when clicking elsewhere in the popup.
+document.addEventListener("click", (event) => {
+  if (event.target.closest?.("#sleepMenu") || event.target.closest?.("#sleepToggle")) {
+    return;
+  }
+  setSleepMenuOpen(false);
 });
 
 document.getElementById("openLibrary")?.addEventListener("click", () => setLibraryOpen(true));
@@ -319,11 +400,16 @@ document.getElementById("libraryList")?.addEventListener("click", (event) => {
 render();
 refreshState();
 void refreshSync();
+void refreshSleep();
 setInterval(refreshState, 1500);
-// Tick the timer locally between polls; it only advances while the session
-// reports a live playback clock.
+setInterval(refreshSleep, 1500);
+// Tick the timers locally between polls: the playback clock while audio is
+// live, and the sleep countdown while a duration timer is running.
 setInterval(() => {
   if (lastState?.playbackResumedAt) {
     render();
+  }
+  if (sleepStatus?.mode === "duration") {
+    renderSleep();
   }
 }, 250);

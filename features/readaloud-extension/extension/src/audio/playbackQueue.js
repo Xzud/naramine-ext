@@ -49,6 +49,8 @@ const ACTIVE_CHAPTER_KEY = "readaloud:activeChapterId";
 const NEXT_CHAPTER_PREFETCH_KEY = "readaloud:nextChapterPrefetch";
 const SYNC_STORIES_KEY = "readaloud:syncStories";
 const SYNC_BACKFILL_KEY = "readaloud:syncBackfill";
+const SLEEP_TIMER_KEY = "readaloud:sleepTimer";
+const SLEEP_ALARM_NAME = "readaloud:sleepTimer";
 const LAST_PLAYED_KEY = "readaloud:lastPlayedByStory";
 const RESUME_TARGET_KEY = "readaloud:resumeTarget";
 const LAST_PLAYED_LIMIT = 30;
@@ -82,11 +84,13 @@ export class PlaybackQueue {
   constructor(
     runtimeApi = globalThis.chrome?.runtime,
     storageArea = globalThis.chrome?.storage?.local,
-    tabsApi = globalThis.chrome?.tabs
+    tabsApi = globalThis.chrome?.tabs,
+    alarmsApi = globalThis.chrome?.alarms
   ) {
     this.runtimeApi = runtimeApi;
     this.storageArea = storageArea;
     this.tabsApi = tabsApi;
+    this.alarmsApi = alarmsApi;
     this.sessionTaskChain = Promise.resolve();
     this.prefetchTaskChain = Promise.resolve();
     this.activeWarmups = new Map();
@@ -110,6 +114,11 @@ export class PlaybackQueue {
       void this.handlePrefetchTabRemoved(tabId).catch(() => {});
       void this.handleBackfillTabRemoved(tabId).catch(() => {});
       void this.handleResumeTabRemoved?.(tabId).catch(() => {});
+    });
+    // chrome.alarms wakes the suspended service worker, so the sleep timer
+    // fires reliably even mid-chapter while only the offscreen audio is live.
+    this.alarmsApi?.onAlarm?.addListener?.((alarm) => {
+      void this.handleSleepAlarm(alarm).catch(() => {});
     });
   }
 
@@ -1045,9 +1054,24 @@ export class PlaybackQueue {
     return { ...context, tabId: resolvedTabId };
   }
 
-  async getSyncStatus(payload = {}) {
+  // Resolves which story the toggle acts on. Prefers the live page, but the
+  // content script in a tab opened before this feature shipped will not answer
+  // the page-context probe; fall back to the active chapter's session so the
+  // toggle still appears for the story the reader is on.
+  async resolveSyncContext(payload = {}) {
     const context = await this.getPageContext(typeof payload.tabId === "number" ? payload.tabId : null);
-    const storyId = payload.storyId || context.storyId || null;
+    let storyId = payload.storyId || context.storyId || null;
+    if (!storyId) {
+      const activeSession = await this.loadSession(await this.getActiveChapterId());
+      if (activeSession?.storyId && activeSession.storyId !== DEFAULT_STORY_ID) {
+        storyId = activeSession.storyId;
+      }
+    }
+    return { context, storyId };
+  }
+
+  async getSyncStatus(payload = {}) {
+    const { context, storyId } = await this.resolveSyncContext(payload);
     if (!storyId) {
       return { ok: false, storyId: null, enabled: false, kind: context.kind };
     }
@@ -1055,8 +1079,7 @@ export class PlaybackQueue {
   }
 
   async setSyncEnabled(payload = {}) {
-    const context = await this.getPageContext(typeof payload.tabId === "number" ? payload.tabId : null);
-    const storyId = payload.storyId || context.storyId || null;
+    const { context, storyId } = await this.resolveSyncContext(payload);
     if (!storyId) {
       return { ok: false, storyId: null, enabled: false, kind: context.kind, error: "no_story_context" };
     }
@@ -1514,6 +1537,111 @@ export class PlaybackQueue {
       this.log("resumed_from_last_played", startedSession, { chapterId, chunkIndex: targetIndex });
       return true;
     });
+  }
+
+  // --- Sleep timer ---------------------------------------------------------
+  // Audible-style: a duration timer pauses mid-chapter when it fires, and
+  // "end of chapter" lets the current chapter finish then pauses instead of
+  // auto-advancing. Either way playback stops without touching in-flight sync
+  // (chapter N / N+1 keep downloading) and without closing any tabs.
+
+  async loadSleepTimer() {
+    const values = await this.storageArea.get(SLEEP_TIMER_KEY);
+    return values[SLEEP_TIMER_KEY] || { mode: "off", deadline: null, durationMs: null };
+  }
+
+  async saveSleepTimer(record) {
+    await this.storageArea.set({ [SLEEP_TIMER_KEY]: record });
+  }
+
+  async clearSleepTimer() {
+    await this.cancelSleepAlarm();
+    if (typeof this.storageArea.remove === "function") {
+      await this.storageArea.remove(SLEEP_TIMER_KEY);
+      return;
+    }
+    await this.storageArea.set({ [SLEEP_TIMER_KEY]: { mode: "off", deadline: null, durationMs: null } });
+  }
+
+  async getSleepTimer(now = Date.now()) {
+    const timer = await this.loadSleepTimer();
+    const remainingMs =
+      timer.mode === "duration" && timer.deadline ? Math.max(0, timer.deadline - now) : null;
+    return {
+      mode: timer.mode || "off",
+      deadline: timer.deadline || null,
+      durationMs: timer.durationMs || null,
+      remainingMs
+    };
+  }
+
+  async setSleepTimer(payload = {}, now = Date.now()) {
+    const mode = payload.mode || "off";
+
+    if (mode === "duration") {
+      const durationMs = Math.max(0, Number(payload.durationMs) || 0);
+      if (!durationMs) {
+        await this.clearSleepTimer();
+        return this.getSleepTimer(now);
+      }
+      const deadline = now + durationMs;
+      await this.saveSleepTimer({ mode: "duration", deadline, durationMs, setAt: now });
+      await this.scheduleSleepAlarm(deadline);
+      this.log("sleep_timer_set", {}, { mode, durationMs });
+    } else if (mode === "end_of_chapter") {
+      await this.cancelSleepAlarm();
+      await this.saveSleepTimer({ mode: "end_of_chapter", deadline: null, durationMs: null, setAt: now });
+      this.log("sleep_timer_set", {}, { mode });
+    } else {
+      await this.clearSleepTimer();
+      this.log("sleep_timer_cleared", {});
+    }
+
+    return this.getSleepTimer(now);
+  }
+
+  async scheduleSleepAlarm(deadline) {
+    if (typeof this.alarmsApi?.create !== "function") {
+      return;
+    }
+    try {
+      await this.alarmsApi.clear(SLEEP_ALARM_NAME);
+    } catch (_error) {
+      // No existing alarm.
+    }
+    this.alarmsApi.create(SLEEP_ALARM_NAME, { when: deadline });
+  }
+
+  async cancelSleepAlarm() {
+    if (typeof this.alarmsApi?.clear !== "function") {
+      return;
+    }
+    try {
+      await this.alarmsApi.clear(SLEEP_ALARM_NAME);
+    } catch (_error) {
+      // Nothing scheduled.
+    }
+  }
+
+  async handleSleepAlarm(alarm) {
+    if (alarm?.name !== SLEEP_ALARM_NAME) {
+      return;
+    }
+    await this.fireDurationSleep();
+  }
+
+  // Pauses the active chapter when a duration timer elapses. No advance, no
+  // tab changes; any warming/prefetch pipeline is left to finish on its own.
+  async fireDurationSleep() {
+    const timer = await this.loadSleepTimer();
+    if (timer.mode !== "duration") {
+      return false;
+    }
+    await this.clearSleepTimer();
+    const activeChapterId = await this.getActiveChapterId();
+    await this.pause(activeChapterId);
+    this.log("sleep_timer_fired", {}, { chapterId: activeChapterId });
+    return true;
   }
 
   // Drops the live resources owned by a finished chapter: its tab and its
@@ -2453,6 +2581,13 @@ export class PlaybackQueue {
         this.log("auto_advance_failed", followUp.advanceSession, { error: String(error) });
       });
     }
+    if (followUp?.sleepPause) {
+      // A duration sleep timer elapsed at this chunk boundary; pause outside
+      // the session lock (pause takes the lock itself) and stop the timer.
+      await this.clearSleepTimer().catch(() => {});
+      await this.pause(followUp.sleepPause).catch(() => {});
+      this.log("sleep_timer_paused", {}, { chapterId: followUp.sleepPause });
+    }
     return followUp;
   }
 
@@ -2555,9 +2690,22 @@ export class PlaybackQueue {
         bufferedAudioMs: 0
       };
       await this.saveSession(savedSession);
+      const sleepTimer = await this.loadSleepTimer();
       if (result.session.state === "ended") {
         await this.clearChunkFocus(result.session).catch(() => {});
+        // "End of chapter": the chapter just finished, so pause here instead
+        // of auto-advancing, and the one-shot timer is done.
+        if (sleepTimer.mode === "end_of_chapter") {
+          await this.clearSleepTimer();
+          this.log("sleep_timer_chapter_end", savedSession, { chapterId });
+          return;
+        }
         return { advanceSession: savedSession };
+      }
+      // A duration timer that elapsed during this chunk pauses at the boundary
+      // rather than rolling into the next chunk.
+      if (sleepTimer.mode === "duration" && sleepTimer.deadline && Date.now() >= sleepTimer.deadline) {
+        return { sleepPause: chapterId };
       }
       await this.processSession(chapterId);
       return;
