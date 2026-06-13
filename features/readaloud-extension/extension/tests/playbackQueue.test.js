@@ -108,6 +108,14 @@ class TestPlaybackQueue extends PlaybackQueue {
     this.sentMessages = sentMessages;
     this.tabMessages = tabMessages;
     this.processCalls = 0;
+    // The off-page playback gate queries the focused tab; default to "on the
+    // page" so the existing play/resume tests are unaffected, and flip this in
+    // the tests that exercise the gate itself.
+    this.viewingChapterPage = options.viewingChapterPage ?? true;
+  }
+
+  async isViewingChapterPage() {
+    return this.viewingChapterPage;
   }
 
   async getCacheSnapshot() {
@@ -2696,4 +2704,137 @@ test("deleting a story turns its sync off and drops its metadata", async () => {
   const syncStories = (await queue.storageArea.get("readaloud:syncStories"))["readaloud:syncStories"];
   assert.deepEqual(syncStories, {});
   assert.deepEqual(deletedMetadata, ["story-gone"]);
+});
+
+function buildWarmSession(chapterId, overrides = {}) {
+  return {
+    chapterId,
+    storyId: `story-${chapterId}`,
+    title: "Off Page Chapter",
+    partId: chapterId,
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    tabId: null,
+    state: "startup_ready",
+    stopped: false,
+    paused: false,
+    playRequested: false,
+    playbackStatus: "idle",
+    currentChunkIndex: 0,
+    currentChunkId: null,
+    totalChunks: 3,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: false,
+    playbackAttemptId: null,
+    nextPlaybackAttemptSequence: 0,
+    lastEvent: "session_warmup_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: null,
+    text: "Off page chapter text",
+    transportMode: "live_stream",
+    streamStatus: "idle",
+    bytesReceived: 0,
+    bufferedAudioMs: 0,
+    firstByteAt: null,
+    firstAudioAt: null,
+    stallCount: 0,
+    ...overrides
+  };
+}
+
+test("play is blocked when the reader is not on the chapter page", async () => {
+  const queue = new TestPlaybackQueue({ viewingChapterPage: false });
+  await queue.setActiveChapterId("chapter-offpage");
+  await queue.saveSession(buildWarmSession("chapter-offpage"));
+
+  const state = await queue.start();
+
+  assert.equal(state.playBlockedOffPage, true);
+  assert.match(state.errorMessage, /Open this chapter in Wattpad/);
+  assert.deepEqual(queue.startedStreams, []);
+  assert.equal(queue.sentMessages.some((message) => message.type === "RESUME_PLAYBACK"), false);
+});
+
+test("play proceeds once the reader is on the chapter page", async () => {
+  const queue = new TestPlaybackQueue({ viewingChapterPage: true });
+  await queue.setActiveChapterId("chapter-onpage");
+  await queue.saveSession(buildWarmSession("chapter-onpage"));
+
+  const state = await queue.start();
+
+  assert.equal(state.playBlockedOffPage, false);
+  assert.equal(state.playRequested, true);
+  assert.deepEqual(queue.startedStreams, ["chapter-onpage"]);
+});
+
+test("returning to the chapter page clears the off-page play block", async () => {
+  const queue = new TestPlaybackQueue({ viewingChapterPage: false });
+  await queue.setActiveChapterId("chapter-return");
+  await queue.saveSession(buildWarmSession("chapter-return"));
+
+  await queue.start();
+  const blocked = await queue.loadSession("chapter-return");
+  assert.equal(blocked.playBlockedOffPage, true);
+
+  // PAGE_READY fires when the reader opens the chapter (visible) again.
+  await queue.warmup({
+    ok: true,
+    text: "Off page chapter text",
+    title: "Off Page Chapter",
+    sourceUrl: "https://www.wattpad.com/chapter-return",
+    storyId: "story-chapter-return",
+    partId: "chapter-return",
+    strategy: "dom-paragraphs",
+    confidence: "high"
+  });
+
+  const cleared = await queue.loadSession("chapter-return");
+  assert.equal(cleared.playBlockedOffPage, false);
+  assert.equal(cleared.errorMessage, null);
+});
+
+test("play of a backfilled chapter is allowed before it is viewed because Play focuses its tab", async () => {
+  const queue = new TestPlaybackQueue({ viewingChapterPage: false });
+  await queue.setActiveChapterId("chapter-backfill");
+  await queue.saveSession(buildWarmSession("chapter-backfill", { tabId: 55, focusTabOnPlay: true }));
+
+  const state = await queue.start();
+
+  assert.notEqual(state.playBlockedOffPage, true);
+  assert.deepEqual(queue.startedStreams, ["chapter-backfill"]);
+  assert.ok(queue.updatedTabs.some((update) => update.tabId === 55 && update.active === true));
+  const session = await queue.loadSession("chapter-backfill");
+  assert.equal(session.focusTabOnPlay, false);
+});
+
+test("isViewingChapterPage matches the focused tab's chapter part id", async () => {
+  const queue = new TestPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_GET_PAGE_CONTEXT") {
+        return { kind: "chapter", ok: true, partId: "222" };
+      }
+      return { ok: true };
+    }
+  });
+
+  assert.equal(await PlaybackQueue.prototype.isViewingChapterPage.call(queue, "222"), true);
+  assert.equal(await PlaybackQueue.prototype.isViewingChapterPage.call(queue, "999"), false);
+});
+
+test("isViewingChapterPage rejects a story overview or non-Wattpad page", async () => {
+  const queue = new TestPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_GET_PAGE_CONTEXT") {
+        return { kind: "story", ok: true, storyId: "42" };
+      }
+      return { ok: true };
+    }
+  });
+
+  assert.equal(await PlaybackQueue.prototype.isViewingChapterPage.call(queue, "222"), false);
 });

@@ -100,3 +100,18 @@ test("errors surface in the view model only when the session failed", () => {
   );
   assert.equal(failed.errorMessage, "TTS exploded");
 });
+
+test("off-page play block surfaces as a hint without marking an error or pause control", () => {
+  const view = buildPopupViewModel(
+    buildState({
+      state: "startup_ready",
+      playbackStatus: "idle",
+      playBlockedOffPage: true,
+      errorMessage: "Open this chapter in Wattpad to play."
+    }),
+    1000
+  );
+
+  assert.equal(view.errorMessage, "Open this chapter in Wattpad to play.");
+  assert.equal(view.pauseable, false);
+});

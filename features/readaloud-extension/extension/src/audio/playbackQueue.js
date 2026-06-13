@@ -1729,6 +1729,38 @@ export class PlaybackQueue {
     };
   }
 
+  // Playback should only run while the reader is actually looking at the
+  // chapter's Wattpad page, so the listen still registers as an organic visit
+  // for Wattpad. Confirms the focused tab is the reading page for this chapter.
+  async isViewingChapterPage(chapterId) {
+    if (!chapterId) {
+      return false;
+    }
+    const context = await this.getPageContext();
+    return Boolean(
+      context?.ok && context.kind === "chapter" && String(context.partId) === String(chapterId)
+    );
+  }
+
+  // Returned when Play is pressed for a chapter the reader is not currently
+  // viewing. The session is left intact (not errored) and flagged so the popup
+  // can prompt the reader to open the page; the flag clears the moment they do
+  // (PAGE_READY -> warmup) or when a play actually starts.
+  async buildOffPagePlaybackBlock(chapterId, session) {
+    const message = "Open this chapter in Wattpad to play — read-aloud follows along on the page.";
+    if (session) {
+      await this.saveSession({
+        ...session,
+        playRequested: false,
+        playBlockedOffPage: true,
+        lastEvent: "play_blocked_off_page",
+        errorMessage: message
+      });
+    }
+    this.log("play_blocked_off_page", session || {}, { chapterId });
+    return this.getState(chapterId);
+  }
+
   async start(options = {}) {
     return this.runExclusive(() => this.startExclusive(options));
   }
@@ -1736,6 +1768,20 @@ export class PlaybackQueue {
   async startExclusive(options = {}) {
     const activeChapterId = await this.resolveChapterId(options.chapterId || null);
     const existingSession = await this.loadSession(activeChapterId);
+
+    // The resume/restart branches below replay a stored chapter that may no
+    // longer be in front of the reader; gate them on actually viewing the
+    // page. The fresh-extraction path reads the active tab directly, so it is
+    // on-page by construction. A backfilled chapter whose own tab we are about
+    // to focus is exempt: focusing it makes it the viewed page.
+    const canReplayExisting = Boolean(existingSession?.text) && existingSession.state !== "error";
+    if (
+      canReplayExisting &&
+      !existingSession.focusTabOnPlay &&
+      !(await this.isViewingChapterPage(activeChapterId))
+    ) {
+      return this.buildOffPagePlaybackBlock(activeChapterId, existingSession);
+    }
 
     if (existingSession?.state === "paused" && !existingSession.stopped) {
       const resumeResponse = await this.resumeOffscreenPlayback();
@@ -1751,7 +1797,8 @@ export class PlaybackQueue {
           streamStatus: hasStarted ? "playing" : "receiving",
           playbackResumedAt: hasStarted ? Date.now() : existingSession.playbackResumedAt || null,
           lastEvent: "session_resumed",
-          errorMessage: null
+          errorMessage: null,
+          playBlockedOffPage: false
         };
         await this.ensureChapterData(resumedSession);
         await this.saveSession(resumedSession);
@@ -1766,7 +1813,8 @@ export class PlaybackQueue {
         ? this.createRestartedSession(existingSession, {
             tabId: options.tabId || existingSession.tabId || null,
             playRequested: true,
-            lastEvent: "play_requested_after_stop"
+            lastEvent: "play_requested_after_stop",
+            playBlockedOffPage: false
           })
         : {
             ...existingSession,
@@ -1780,7 +1828,9 @@ export class PlaybackQueue {
                 : existingSession.state,
             playbackStatus: wasPaused ? "idle" : existingSession.playbackStatus,
             streamStatus: wasPaused ? "idle" : existingSession.streamStatus,
-            lastEvent: "play_requested"
+            lastEvent: "play_requested",
+            errorMessage: null,
+            playBlockedOffPage: false
           };
       if (existingSession.focusTabOnPlay) {
         // A backfilled chapter 1 lives in a background tab; the spec switches
@@ -1845,6 +1895,7 @@ export class PlaybackQueue {
             playRequested: false,
             state: "startup_ready",
             lastEvent: "session_warmup_resumed",
+            playBlockedOffPage: false,
             ...nextPartUpgrade
           })
         : {
@@ -1855,6 +1906,10 @@ export class PlaybackQueue {
             playRequested: false,
             state: "startup_ready",
             lastEvent: "session_warmup_resumed",
+            // The reader is back on the page, so any earlier off-page play
+            // block no longer applies.
+            errorMessage: existingSession.playBlockedOffPage ? null : existingSession.errorMessage || null,
+            playBlockedOffPage: false,
             ...nextPartUpgrade
           };
       await this.ensureChapterData(resumedWarmSession);

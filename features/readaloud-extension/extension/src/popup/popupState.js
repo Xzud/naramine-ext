@@ -111,6 +111,13 @@ export function buildLibraryViewModel(library) {
 
 export function buildPopupViewModel(state, now = Date.now()) {
   const available = Boolean(state?.stateAvailable);
+  // The off-page block is an actionable hint, not a failure, but it surfaces
+  // through the same message slot so the reader knows why nothing played.
+  const showMessage =
+    !available ||
+    Boolean(state?.playBlockedOffPage) ||
+    state.state === "error" ||
+    state.playbackStatus === "error";
 
   return {
     title: (available && state.title) || "Read Aloud",
@@ -119,9 +126,6 @@ export function buildPopupViewModel(state, now = Date.now()) {
     timerRunning: Boolean(available && state.playbackResumedAt),
     warmedRatio: getWarmedRatio(state),
     chapterRatio: getChapterRatio(state),
-    errorMessage:
-      available && state.state !== "error" && state.playbackStatus !== "error"
-        ? null
-        : state?.errorMessage || state?.unavailableReason || null
+    errorMessage: showMessage ? state?.errorMessage || state?.unavailableReason || null : null
   };
 }
