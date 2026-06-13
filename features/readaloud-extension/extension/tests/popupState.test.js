@@ -84,7 +84,7 @@ test("bar ratios reflect played and warmed chunks against the total", () => {
 test("unavailable state renders a safe empty player", () => {
   const view = buildPopupViewModel(createUnavailableRuntimeState("Service worker unreachable."), 1000);
 
-  assert.equal(view.title, "Read Aloud");
+  assert.equal(view.title, "Naramine");
   assert.equal(view.timerLabel, "0:00");
   assert.equal(view.timerRunning, false);
   assert.equal(view.warmedRatio, 0);

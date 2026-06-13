@@ -195,7 +195,7 @@ export function buildPopupViewModel(state, now = Date.now()) {
     state.playbackStatus === "error";
 
   return {
-    title: (available && state.title) || "Read Aloud",
+    title: (available && state.title) || "Naramine",
     pauseable: isPauseable(state),
     timerLabel: formatTimer(computeElapsedMs(state, now)),
     timerRunning: Boolean(available && state.playbackResumedAt),

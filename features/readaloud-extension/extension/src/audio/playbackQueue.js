@@ -2147,7 +2147,7 @@ export class PlaybackQueue {
   // can prompt the reader to open the page; the flag clears the moment they do
   // (PAGE_READY -> warmup) or when a play actually starts.
   async buildOffPagePlaybackBlock(chapterId, session) {
-    const message = "Open this chapter in Wattpad to play — read-aloud follows along on the page.";
+    const message = "Open this chapter in Wattpad to play — Naramine follows along on the page.";
     if (session) {
       await this.saveSession({
         ...session,

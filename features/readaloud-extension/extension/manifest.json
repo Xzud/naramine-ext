@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Readaloud MVP",
+  "name": "Naramine",
   "version": "0.1.0",
   "permissions": ["storage", "offscreen", "activeTab", "tabs", "alarms"],
   "host_permissions": ["http://localhost:8880/*", "http://localhost:3000/*"],

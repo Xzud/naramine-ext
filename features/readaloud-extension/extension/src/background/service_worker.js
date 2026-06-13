@@ -63,7 +63,7 @@ async function handleScopedRequest(message, sender) {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  console.log("Readaloud MVP installed");
+  console.log("Naramine installed");
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
