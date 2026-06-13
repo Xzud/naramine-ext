@@ -124,6 +124,66 @@ export function buildLibraryViewModel(library) {
   };
 }
 
+// True while audio is actively playing or paused (not idle/ended/error). Used
+// to keep the player visible even on an unsupported tab so transport controls
+// for the in-progress chapter are never stranded.
+export function isPlaybackActive(state) {
+  if (!state?.stateAvailable) {
+    return false;
+  }
+  if (state.state === "paused" || state.playbackStatus === "paused") {
+    return true;
+  }
+  return PAUSEABLE_PLAYBACK_STATUSES.has(state.playbackStatus);
+}
+
+// Decides which of the three top-level views the popup shows. The player only
+// appears when the active tab is a supported page (a Wattpad chapter or story
+// overview) or when something is already playing; otherwise the guide explains
+// how to start and offers a way back into recent reads.
+export function selectPrimaryView({ pageContext, state, libraryOpen } = {}) {
+  if (libraryOpen) {
+    return "library";
+  }
+  const kind = pageContext?.kind;
+  const supported = kind === "chapter" || kind === "story";
+  if (supported || isPlaybackActive(state)) {
+    return "player";
+  }
+  return "guide";
+}
+
+const GUIDE_RECENTS_LIMIT = 5;
+
+// Shapes the "continue where you left off" rows for the guide from the recents
+// map the background persists: a chapter title plus a short progress readout.
+export function buildGuideViewModel(recents) {
+  const items = Array.isArray(recents?.recents)
+    ? recents.recents
+    : Array.isArray(recents)
+      ? recents
+      : [];
+  const mapped = items
+    .filter((item) => item && item.storyId && item.chapterId)
+    .slice(0, GUIDE_RECENTS_LIMIT)
+    .map((item) => {
+      const percent =
+        item.totalChunks > 0
+          ? Math.min(99, Math.floor((item.chunkIndex / item.totalChunks) * 100))
+          : null;
+      return {
+        storyId: item.storyId,
+        chapterId: item.chapterId,
+        title: item.chapterTitle || "Your last chapter",
+        meta: percent === null ? "Resume" : `${percent}% in`
+      };
+    });
+  return {
+    hasRecents: mapped.length > 0,
+    recents: mapped
+  };
+}
+
 export function buildPopupViewModel(state, now = Date.now()) {
   const available = Boolean(state?.stateAvailable);
   // The off-page block is an actionable hint, not a failure, but it surfaces

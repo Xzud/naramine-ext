@@ -17,6 +17,10 @@ async function handleScopedRequest(message, sender) {
       });
     case "STORY_PAGE_READY":
       return queue.handleStoryPageReady(message.payload || {});
+    case "PAGE_CONTEXT_GET":
+      return queue.getPageContextStatus({ ...(message.payload || {}), tabId });
+    case "RECENTS_GET":
+      return queue.getRecentlyPlayed();
     case "SYNC_GET":
       return queue.getSyncStatus({ ...(message.payload || {}), tabId });
     case "SYNC_SET":

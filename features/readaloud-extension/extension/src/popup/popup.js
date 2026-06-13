@@ -1,5 +1,14 @@
 import { createUnavailableRuntimeState } from "../audio/runtimeState.js";
-import { buildLibraryViewModel, buildPopupViewModel, formatTimer, isPauseable } from "./popupState.js";
+import {
+  buildGuideViewModel,
+  buildLibraryViewModel,
+  buildPopupViewModel,
+  formatTimer,
+  isPauseable,
+  selectPrimaryView
+} from "./popupState.js";
+
+const WATTPAD_HOME_URL = "https://www.wattpad.com/";
 
 const PLAY_ICON_PATH =
   '<path d="M8 6.82v10.36c0 .79.87 1.27 1.54.84l8.14-5.18a1 1 0 0 0 0-1.68L9.54 5.98A1 1 0 0 0 8 6.82Z" />';
@@ -11,10 +20,14 @@ const CONFIRM_RESET_MS = 3500;
 
 let lastState = null;
 let lastLibrarySignature = null;
+let lastGuideSignature = null;
 let libraryOpen = false;
 let confirmResetTimer = null;
 let syncStatus = null;
 let sleepStatus = null;
+// What the active tab is ({ kind: "chapter" | "story" | "none", ... }). Drives
+// whether the popup shows the player or the "open a story" guide.
+let pageContext = null;
 
 async function request(type, payload = {}) {
   try {
@@ -185,13 +198,76 @@ async function refreshLibrary(options = {}) {
   }
 }
 
+// Single place that maps the current page/playback/library state onto exactly
+// one visible view, so the three <main>s never fight over `hidden`.
+function applyView() {
+  const view = selectPrimaryView({ pageContext, state: lastState, libraryOpen });
+  document.getElementById("playerView").hidden = view !== "player";
+  document.getElementById("guideView").hidden = view !== "guide";
+  document.getElementById("libraryView").hidden = view !== "library";
+}
+
 function setLibraryOpen(open) {
   libraryOpen = open;
-  document.getElementById("playerView").hidden = open;
-  document.getElementById("libraryView").hidden = !open;
+  applyView();
   if (open) {
     lastLibrarySignature = null;
     void refreshLibrary({ force: true });
+  }
+}
+
+const RECENT_PLAY_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true">${PLAY_ICON_PATH}</svg>`;
+
+function createRecentItem(recent) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "recent-item";
+  button.dataset.continueStoryId = recent.storyId;
+  button.title = `Continue ${recent.title}`;
+
+  const icon = document.createElement("span");
+  icon.className = "recent-play";
+  icon.setAttribute("aria-hidden", "true");
+  icon.innerHTML = RECENT_PLAY_ICON;
+
+  const text = document.createElement("div");
+  text.className = "recent-text";
+
+  const title = document.createElement("span");
+  title.className = "recent-title";
+  title.textContent = recent.title;
+
+  const meta = document.createElement("span");
+  meta.className = "recent-meta";
+  meta.textContent = recent.meta;
+
+  text.append(title, meta);
+  button.append(icon, text);
+  return button;
+}
+
+function renderGuide(recents) {
+  const view = buildGuideViewModel(recents);
+  document.getElementById("guideRecents").hidden = !view.hasRecents;
+
+  const signature = JSON.stringify(view);
+  if (signature === lastGuideSignature) {
+    return;
+  }
+  lastGuideSignature = signature;
+  document.getElementById("recentList").replaceChildren(...view.recents.map(createRecentItem));
+}
+
+async function refreshGuide() {
+  renderGuide(await request("RECENTS_GET"));
+}
+
+async function refreshPageContext() {
+  const next = await request("PAGE_CONTEXT_GET");
+  // Only adopt a well-formed response; a transport failure leaves the last
+  // known context in place rather than bouncing the view.
+  if (next && typeof next.kind === "string") {
+    pageContext = next;
   }
 }
 
@@ -228,14 +304,23 @@ async function handleDeleteClick(button) {
 async function refreshState() {
   lastState = await request("GET_STATE");
   render();
-  // The first sync probe can miss (service worker waking, content script just
-  // loaded); keep retrying on the poll until the story under the toggle
-  // resolves, then stop re-probing the page.
+  await refreshPageContext();
+  applyView();
+
+  const view = selectPrimaryView({ pageContext, state: lastState, libraryOpen });
+  if (view === "library") {
+    await refreshLibrary();
+    return;
+  }
+  if (view === "guide") {
+    await refreshGuide();
+    return;
+  }
+  // Player view: the first sync probe can miss (service worker waking, content
+  // script just loaded); keep retrying on the poll until the story under the
+  // toggle resolves, then stop re-probing the page.
   if (!syncStatus?.ok) {
     await refreshSync();
-  }
-  if (libraryOpen) {
-    await refreshLibrary();
   }
 }
 
@@ -365,6 +450,22 @@ document.addEventListener("click", (event) => {
 
 document.getElementById("openLibrary")?.addEventListener("click", () => setLibraryOpen(true));
 document.getElementById("closeLibrary")?.addEventListener("click", () => setLibraryOpen(false));
+document.getElementById("guideLibrary")?.addEventListener("click", () => setLibraryOpen(true));
+
+document.getElementById("browseWattpad")?.addEventListener("click", () => {
+  if (chrome.tabs?.create) {
+    void chrome.tabs.create({ url: WATTPAD_HOME_URL });
+  } else {
+    window.open(WATTPAD_HOME_URL, "_blank");
+  }
+});
+
+document.getElementById("recentList")?.addEventListener("click", (event) => {
+  const item = event.target.closest?.(".recent-item");
+  if (item) {
+    void handleContinueClick(item);
+  }
+});
 
 async function handleContinueClick(button) {
   button.disabled = true;

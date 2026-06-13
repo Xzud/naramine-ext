@@ -3273,3 +3273,47 @@ test("without a sleep timer a finished chapter still auto-advances", async () =>
   // The next chapter was opened in a background tab for handoff.
   assert.ok(queue.createdTabs.some((tab) => tab.url === "https://www.wattpad.com/next-adv"));
 });
+
+test("getRecentlyPlayed returns usable rows newest-first within the limit", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.saveLastPlayed({
+    "story-a": { storyId: "story-a", chapterId: "a1", chapterTitle: "A", chunkIndex: 1, totalChunks: 4, updatedAt: 100 },
+    "story-b": { storyId: "story-b", chapterId: "b1", chapterTitle: "B", chunkIndex: 2, totalChunks: 4, updatedAt: 300 },
+    "story-c": { storyId: "story-c", chapterId: "c1", chapterTitle: "C", chunkIndex: 0, totalChunks: 4, updatedAt: 200 },
+    "broken": { storyId: null, chapterId: "x", updatedAt: 999 }
+  });
+
+  const { ok, recents } = await queue.getRecentlyPlayed(2);
+  assert.equal(ok, true);
+  assert.deepEqual(recents.map((r) => r.storyId), ["story-b", "story-c"]);
+});
+
+test("getPageContextStatus reports supported chapter pages", async () => {
+  const queue = new TestPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_GET_PAGE_CONTEXT") {
+        return { kind: "chapter", ok: true, storyId: "story-x", partId: "777", title: "Chapter 7" };
+      }
+      return { ok: true };
+    }
+  });
+
+  const status = await queue.getPageContextStatus({ tabId: 5 });
+  assert.equal(status.ok, true);
+  assert.equal(status.kind, "chapter");
+  assert.equal(status.storyId, "story-x");
+  assert.equal(status.partId, "777");
+});
+
+test("getPageContextStatus reports unsupported pages as none", async () => {
+  const queue = new TestPlaybackQueue({
+    onTabMessage() {
+      return { ok: true };
+    }
+  });
+
+  const status = await queue.getPageContextStatus({ tabId: 5 });
+  assert.equal(status.ok, false);
+  assert.equal(status.kind, "none");
+  assert.equal(status.storyId, null);
+});

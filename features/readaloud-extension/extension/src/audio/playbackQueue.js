@@ -1078,6 +1078,32 @@ export class PlaybackQueue {
     return { context, storyId };
   }
 
+  // Single-purpose probe of the active tab so the popup can decide whether to
+  // show the player or the guide. "none" covers both unsupported sites and
+  // pages where no content script runs (chrome:// pages, the new-tab page).
+  async getPageContextStatus(payload = {}) {
+    const context = await this.getPageContext(typeof payload.tabId === "number" ? payload.tabId : null);
+    return {
+      ok: context.kind !== "none",
+      kind: context.kind || "none",
+      storyId: context.storyId || null,
+      partId: context.partId || null,
+      title: context.title || null
+    };
+  }
+
+  // Most-recently-played chapters across stories, for the guide's "continue
+  // where you left off" list. Reads only the persisted recents map (no page
+  // round-trip), so it is cheap to call whenever the guide is visible.
+  async getRecentlyPlayed(limit = 6) {
+    const map = await this.loadLastPlayed();
+    const recents = Object.values(map)
+      .filter((record) => record && record.storyId && record.chapterId)
+      .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0))
+      .slice(0, limit);
+    return { ok: true, recents };
+  }
+
   async getSyncStatus(payload = {}) {
     const { context, storyId } = await this.resolveSyncContext(payload);
     if (!storyId) {

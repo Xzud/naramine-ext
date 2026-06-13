@@ -534,6 +534,219 @@
         display: none;
       }
 
+      /* ============================ GUIDE ============================ */
+
+      .guide {
+        position: relative;
+        z-index: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 22px;
+        padding: 52px 26px 28px;
+        isolation: isolate;
+      }
+
+      .guide::after {
+        content: "";
+        position: absolute;
+        z-index: -1;
+        top: 30px;
+        left: 50%;
+        width: 200px;
+        height: 200px;
+        transform: translateX(-50%);
+        background: radial-gradient(circle, var(--amber-glow), transparent 68%);
+        filter: blur(30px);
+        opacity: 0.4;
+        pointer-events: none;
+      }
+
+      .guide-library {
+        position: absolute;
+        top: 14px;
+        right: 14px;
+      }
+
+      .guide-hero {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+        gap: 11px;
+        animation: rise 520ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+      }
+
+      .guide-mark {
+        display: grid;
+        place-items: center;
+        width: 58px;
+        height: 58px;
+        margin-bottom: 4px;
+        border-radius: 18px;
+        background: radial-gradient(circle at 38% 30%, var(--amber-bright), var(--amber) 55%, var(--amber-deep));
+        color: #2a1c08;
+        box-shadow: 0 8px 26px rgba(0, 0, 0, 0.45), 0 0 30px -4px var(--amber-glow);
+      }
+
+      .guide-mark svg {
+        width: 30px;
+        height: 30px;
+        fill: currentColor;
+      }
+
+      .guide-title {
+        margin: 0;
+        font-family: var(--font-display);
+        font-weight: 480;
+        font-size: 22px;
+        line-height: 1.2;
+        letter-spacing: -0.01em;
+        text-wrap: balance;
+      }
+
+      .guide-sub {
+        margin: 0;
+        max-width: 250px;
+        font-size: 12.5px;
+        line-height: 1.55;
+        color: var(--cream-dim);
+      }
+
+      .guide-primary {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-top: 6px;
+        border: none;
+        border-radius: 999px;
+        background: linear-gradient(180deg, var(--amber), var(--amber-deep));
+        color: #2a1c08;
+        font-family: var(--font-ui);
+        font-size: 12.5px;
+        font-weight: 700;
+        letter-spacing: 0.01em;
+        padding: 10px 18px;
+        cursor: pointer;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4), 0 0 22px -4px var(--amber-glow);
+        transition: transform 140ms ease, box-shadow 220ms ease;
+      }
+
+      .guide-primary:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 22px rgba(0, 0, 0, 0.45), 0 0 30px -2px var(--amber-glow);
+      }
+
+      .guide-primary:active {
+        transform: translateY(0);
+      }
+
+      .guide-primary svg {
+        width: 15px;
+        height: 15px;
+        fill: currentColor;
+      }
+
+      .guide-recents {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        animation: rise 520ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+        animation-delay: 90ms;
+      }
+
+      .guide-recents[hidden] {
+        display: none;
+      }
+
+      .guide-section-title {
+        margin: 0 2px;
+        font-size: 9.5px;
+        font-weight: 700;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      .recent-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .recent-item {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        width: 100%;
+        border: 1px solid var(--hairline-soft);
+        border-radius: 13px;
+        background: var(--panel);
+        color: var(--cream);
+        font-family: var(--font-ui);
+        text-align: left;
+        padding: 11px 13px;
+        cursor: pointer;
+        transition: border-color 160ms ease, background 160ms ease, transform 140ms ease;
+      }
+
+      .recent-item:hover {
+        border-color: var(--hairline);
+        background: var(--panel-strong);
+        transform: translateY(-1px);
+      }
+
+      .recent-item:active {
+        transform: translateY(0);
+      }
+
+      .recent-item:disabled {
+        opacity: 0.55;
+        cursor: default;
+        transform: none;
+      }
+
+      .recent-play {
+        flex: none;
+        display: grid;
+        place-items: center;
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background: rgba(240, 180, 94, 0.14);
+        color: var(--amber);
+      }
+
+      .recent-play svg {
+        width: 14px;
+        height: 14px;
+        fill: currentColor;
+      }
+
+      .recent-text {
+        flex: 1;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+
+      .recent-title {
+        font-size: 12.5px;
+        font-weight: 500;
+        line-height: 1.25;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .recent-meta {
+        font-size: 10.5px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
       /* ============================ LIBRARY ============================ */
 
       .library {
@@ -931,6 +1144,40 @@
       </div>
 
       <p id="error" class="error" hidden></p>
+    </main>
+
+    <main id="guideView" class="guide" hidden>
+      <button id="guideLibrary" class="icon-button guide-library" aria-label="Library" title="Library">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M5 4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4Zm6 0a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1h-2a1 1 0 0 1-1-1V4Zm6.06.65a1 1 0 0 1 1.25-.66l1.9.62a1 1 0 0 1 .65 1.26l-4.7 14.46a1 1 0 0 1-1.26.65l-1.9-.62a1 1 0 0 1-.65-1.26l4.71-14.45Z" />
+        </svg>
+      </button>
+
+      <div class="guide-hero">
+        <span class="guide-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H11a1 1 0 0 1 1 1v15a1 1 0 0 1-1.45.9A4 4 0 0 0 8.8 19.5H5a1 1 0 0 1-1-1V5.5Zm16 0A2.5 2.5 0 0 0 17.5 3H13a1 1 0 0 0-1 1v15a1 1 0 0 0 1.45.9 4 4 0 0 1 1.75-.4H19a1 1 0 0 0 1-1V5.5Z" />
+          </svg>
+        </span>
+        <p class="eyebrow">Read Aloud</p>
+        <h1 class="guide-title">Open a story to listen</h1>
+        <p class="guide-sub">
+          Read Aloud narrates Wattpad chapters as you read. Open a Wattpad story or
+          chapter, then press play here — the audio follows along on the page.
+        </p>
+        <button id="browseWattpad" class="guide-primary" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M14 4a1 1 0 0 1 1-1h5a1 1 0 0 1 1 1v5a1 1 0 1 1-2 0V6.41l-7.3 7.3a1 1 0 0 1-1.4-1.42L17.59 5H15a1 1 0 0 1-1-1Z" />
+            <path d="M5 6a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-4a1 1 0 1 0-2 0v4H5V8h4a1 1 0 0 0 0-2H5Z" />
+          </svg>
+          Browse Wattpad
+        </button>
+      </div>
+
+      <section id="guideRecents" class="guide-recents" hidden>
+        <h2 class="guide-section-title">Pick up where you left off</h2>
+        <div id="recentList" class="recent-list"></div>
+      </section>
     </main>
 
     <main id="libraryView" class="library" hidden>

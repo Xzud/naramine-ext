@@ -3,12 +3,15 @@ import assert from "node:assert/strict";
 
 import { createUnavailableRuntimeState } from "../src/audio/runtimeState.js";
 import {
+  buildGuideViewModel,
   buildPopupViewModel,
   computeElapsedMs,
   formatTimer,
   getChapterRatio,
   getWarmedRatio,
-  isPauseable
+  isPauseable,
+  isPlaybackActive,
+  selectPrimaryView
 } from "../src/popup/popupState.js";
 
 function buildState(overrides = {}) {
@@ -114,4 +117,81 @@ test("off-page play block surfaces as a hint without marking an error or pause c
 
   assert.equal(view.errorMessage, "Open this chapter in Wattpad to play.");
   assert.equal(view.pauseable, false);
+});
+
+test("selectPrimaryView shows the library whenever it is open", () => {
+  assert.equal(
+    selectPrimaryView({ pageContext: { kind: "none" }, state: null, libraryOpen: true }),
+    "library"
+  );
+});
+
+test("selectPrimaryView shows the player on supported pages", () => {
+  for (const kind of ["chapter", "story"]) {
+    assert.equal(
+      selectPrimaryView({ pageContext: { kind }, state: null, libraryOpen: false }),
+      "player"
+    );
+  }
+});
+
+test("selectPrimaryView shows the guide on unsupported pages when nothing is playing", () => {
+  assert.equal(
+    selectPrimaryView({ pageContext: { kind: "none" }, state: buildState({ state: "idle", playbackStatus: "idle", stateAvailable: true }), libraryOpen: false }),
+    "guide"
+  );
+  assert.equal(
+    selectPrimaryView({ pageContext: null, state: null, libraryOpen: false }),
+    "guide"
+  );
+});
+
+test("selectPrimaryView keeps the player on an unsupported page while audio is active", () => {
+  const playing = selectPrimaryView({
+    pageContext: { kind: "none" },
+    state: buildState({ state: "awaiting_chunk_end", playbackStatus: "playing" }),
+    libraryOpen: false
+  });
+  assert.equal(playing, "player");
+
+  const paused = selectPrimaryView({
+    pageContext: { kind: "none" },
+    state: buildState({ state: "paused", playbackStatus: "paused" }),
+    libraryOpen: false
+  });
+  assert.equal(paused, "player");
+});
+
+test("isPlaybackActive is false for idle, ended, and error sessions", () => {
+  assert.equal(isPlaybackActive(buildState({ state: "idle", playbackStatus: "idle" })), false);
+  assert.equal(isPlaybackActive(buildState({ state: "ended", playbackStatus: "ended" })), false);
+  assert.equal(isPlaybackActive(buildState({ state: "error", playbackStatus: "error" })), false);
+  assert.equal(isPlaybackActive(null), false);
+  assert.equal(isPlaybackActive(createUnavailableRuntimeState("nope")), false);
+});
+
+test("buildGuideViewModel maps recents to titles with progress and drops malformed rows", () => {
+  const view = buildGuideViewModel({
+    recents: [
+      { storyId: "s1", chapterId: "c1", chapterTitle: "Chapter One", chunkIndex: 5, totalChunks: 10 },
+      { storyId: "s2", chapterId: "c2", chapterTitle: "Chapter Two", chunkIndex: 0, totalChunks: 0 },
+      { storyId: null, chapterId: "c3", chapterTitle: "No story" }
+    ]
+  });
+
+  assert.equal(view.hasRecents, true);
+  assert.equal(view.recents.length, 2);
+  assert.deepEqual(view.recents[0], {
+    storyId: "s1",
+    chapterId: "c1",
+    title: "Chapter One",
+    meta: "50% in"
+  });
+  assert.equal(view.recents[1].meta, "Resume");
+});
+
+test("buildGuideViewModel reports empty when there are no usable recents", () => {
+  assert.equal(buildGuideViewModel({ recents: [] }).hasRecents, false);
+  assert.equal(buildGuideViewModel(null).hasRecents, false);
+  assert.equal(buildGuideViewModel({ recents: [{ storyId: "s" }] }).hasRecents, false);
 });
