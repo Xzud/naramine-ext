@@ -190,6 +190,16 @@ export async function getAudioChunksByChapter(chapterId) {
   );
 }
 
+// Returns only the cached chunk IDs (the audioChunks primary keys) for a
+// chapter, without deserializing the WAV blobs. The warming pipeline reads
+// this once per chunk it synthesizes purely to skip already-cached chunks, so
+// loading the full blobs (getAudioChunksByChapter) there is O(n^2) bytes.
+export async function getAudioChunkIdsByChapter(chapterId) {
+  return withTransaction(["audioChunks"], "readonly", ({ audioChunks }) =>
+    promisifyRequest(audioChunks.index("chapterId").getAllKeys(chapterId))
+  );
+}
+
 export async function countReadyAudioAhead(chapterId, currentChunkIndex) {
   const audioChunks = await getAudioChunksByChapter(chapterId);
   return audioChunks.filter((record) => record.chunkIndex >= currentChunkIndex).length;

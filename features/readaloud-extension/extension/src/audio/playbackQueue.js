@@ -14,6 +14,7 @@ import {
   deleteChapterData,
   deleteStoryMetadata,
   getAllStoryMetadata,
+  getAudioChunkIdsByChapter,
   getAudioChunksByChapter,
   getCacheStatus,
   getChapter,
@@ -248,6 +249,13 @@ export class PlaybackQueue {
     return getAudioChunksByChapter(chapterId);
   }
 
+  // Cached-chunk-ID lookup that skips loading the audio blobs. Used by the
+  // warming pipeline's tail scan, which only needs to know which chunks are
+  // already cached.
+  async getAudioChunkIdsForChapter(chapterId) {
+    return getAudioChunkIdsByChapter(chapterId);
+  }
+
   async saveAudioRecord(record) {
     return saveAudioChunk(record);
   }
@@ -308,11 +316,11 @@ export class PlaybackQueue {
   }
 
   async findNextChunkToWarm(chapterId, fromChunkIndex) {
-    const [chunks, audioRecords] = await Promise.all([
+    const [chunks, cachedIds] = await Promise.all([
       this.getChapterChunkRecords(chapterId),
-      this.getAudioRecordsForChapter(chapterId)
+      this.getAudioChunkIdsForChapter(chapterId)
     ]);
-    const cachedChunkIds = new Set(audioRecords.map((record) => record.chunkId));
+    const cachedChunkIds = new Set(cachedIds);
     return (
       chunks.find(
         (chunk) =>

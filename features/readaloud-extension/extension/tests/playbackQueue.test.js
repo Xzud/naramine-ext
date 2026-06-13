@@ -138,6 +138,12 @@ class TestPlaybackQueue extends PlaybackQueue {
     return this.cacheSnapshot;
   }
 
+  // Mirror the production key-only lookup against whatever audio store the
+  // subclass exposes, so warming tests exercise findNextChunkToWarm's new path.
+  async getAudioChunkIdsForChapter(chapterId) {
+    return (await this.getAudioRecordsForChapter(chapterId)).map((record) => record.chunkId);
+  }
+
   async cleanupExpiredAudioRecords() {}
 
   async deleteChapterRecords(chapterId) {
@@ -1778,10 +1784,20 @@ class WarmingPlaybackQueue extends LazyLoadPlaybackQueue {
     this.audioStore = [];
     this.warmedChunkIds = [];
     this.failChunkIds = options.failChunkIds || new Set();
+    // Counts how often the warming pipeline loads full audio records (blobs).
+    // The tail scan should use the key-only path instead.
+    this.audioRecordLoads = 0;
   }
 
   async getAudioRecordsForChapter(chapterId) {
+    this.audioRecordLoads += 1;
     return this.audioStore.filter((record) => record.chapterId === chapterId);
+  }
+
+  // Key-only lookup backed directly by the in-memory store, independent of the
+  // blob-loading getAudioRecordsForChapter, so warming never deserializes blobs.
+  async getAudioChunkIdsForChapter(chapterId) {
+    return this.audioStore.filter((record) => record.chapterId === chapterId).map((record) => record.chunkId);
   }
 
   async saveAudioRecord(record) {
@@ -1837,6 +1853,25 @@ test("warming pipeline buffers every remaining chunk to the audio cache in order
   for (const chunk of queue.chunkStore.slice(1)) {
     assert.equal(chunk.status, "ready");
   }
+});
+
+test("warming pipeline scans for cached chunks via the key-only path, never loading blobs", async () => {
+  const { chapter, queue } = buildWarmingFixture(6, "chapter-warm-keys");
+
+  await queue.saveSession(
+    buildPlayingSession("chapter-warm-keys", {
+      currentChunkId: chapter.chunks[0].chunkId,
+      totalChunks: chapter.chunks.length,
+      text: chapter.text
+    })
+  );
+
+  await queue.ensureWarmingPipeline("chapter-warm-keys");
+
+  // Every remaining chunk still gets cached, but the tail scan used the
+  // key-only lookup so the full audio records (blobs) were never deserialized.
+  assert.equal(queue.audioStore.length, chapter.chunks.length - 1);
+  assert.equal(queue.audioRecordLoads, 0);
 });
 
 test("warming pipeline picks up chunks added after the chapter grows", async () => {
