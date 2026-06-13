@@ -15,6 +15,12 @@ async function handleScopedRequest(message, sender) {
         ...(message.payload || {}),
         tabId
       });
+    case "STORY_PAGE_READY":
+      return queue.handleStoryPageReady(message.payload || {});
+    case "SYNC_GET":
+      return queue.getSyncStatus({ ...(message.payload || {}), tabId });
+    case "SYNC_SET":
+      return queue.setSyncEnabled({ ...(message.payload || {}), tabId });
     case "PLAY":
       return queue.start({
         ...(message.payload || {}),

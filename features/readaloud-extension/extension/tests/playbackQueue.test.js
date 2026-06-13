@@ -1911,6 +1911,205 @@ test("warming pipeline is single-flight per chapter", async () => {
   assert.deepEqual(queue.warmedChunkIds, expected);
 });
 
+function buildTwoChapterWarmingFixture(currentId, nextId, { currentParagraphs = 4, nextParagraphs = 3 } = {}) {
+  const current = buildParagraphChapter(currentParagraphs, {
+    chapterId: currentId,
+    storyId: "story-priority",
+    title: "Warming Chapter"
+  });
+  const next = buildParagraphChapter(nextParagraphs, {
+    chapterId: nextId,
+    storyId: "story-priority",
+    title: "Warming Chapter"
+  });
+  const queue = new WarmingPlaybackQueue({
+    chunkStore: [...current.chunks, ...next.chunks].map((chunk) => ({ ...chunk, status: "pending" }))
+  });
+  return { current, next, queue };
+}
+
+function buildWarmOnlySession(chapter) {
+  return buildPlayingSession(chapter.chapter.chapterId, {
+    playRequested: false,
+    state: "startup_ready",
+    playbackStatus: "idle",
+    streamStatus: "idle",
+    hasStartedPlayback: false,
+    currentChunkId: null,
+    totalChunks: chapter.chunks.length,
+    text: chapter.text
+  });
+}
+
+test("next-chapter warming yields until the active chapter is fully warmed", async () => {
+  const { current, next, queue } = buildTwoChapterWarmingFixture("warm-priority-current", "warm-priority-next");
+
+  await queue.setActiveChapterId("warm-priority-current");
+  await queue.saveSession(
+    buildPlayingSession("warm-priority-current", {
+      currentChunkId: current.chunks[0].chunkId,
+      totalChunks: current.chunks.length,
+      text: current.text
+    })
+  );
+  await queue.saveSession(buildWarmOnlySession(next));
+
+  const outcome = await queue.ensureWarmingPipeline("warm-priority-next");
+
+  assert.equal(outcome, "yielded");
+  assert.ok(queue.pendingWarmups.has("warm-priority-next"));
+
+  // The gate kicked the active chapter's pipeline; it must finish first.
+  const currentPipeline = queue.activeWarmups.get("warm-priority-current");
+  assert.ok(currentPipeline);
+  await currentPipeline;
+
+  const currentChunkIds = current.chunks.slice(1).map((chunk) => chunk.chunkId);
+  assert.deepEqual(queue.warmedChunkIds.slice(0, currentChunkIds.length), currentChunkIds);
+
+  // Completing the active chapter resumed the parked next-chapter pipeline,
+  // which warms from the top so the chapter becomes a complete download.
+  const nextPipeline = queue.activeWarmups.get("warm-priority-next");
+  assert.ok(nextPipeline);
+  await nextPipeline;
+
+  assert.deepEqual(queue.warmedChunkIds, [...currentChunkIds, ...next.chunks.map((chunk) => chunk.chunkId)]);
+});
+
+test("chapter growth pulls warming back from the next chapter", async () => {
+  const { current, next, queue } = buildTwoChapterWarmingFixture("warm-grow-current", "warm-grow-next");
+
+  await queue.setActiveChapterId("warm-grow-current");
+  await queue.saveSession(
+    buildPlayingSession("warm-grow-current", {
+      currentChunkId: current.chunks[0].chunkId,
+      totalChunks: current.chunks.length,
+      text: current.text
+    })
+  );
+  await queue.saveSession(buildWarmOnlySession(next));
+  // The current chapter is already fully warmed ahead of the playhead.
+  queue.audioStore = current.chunks.slice(1).map((chunk) => ({
+    chunkId: chunk.chunkId,
+    chapterId: chunk.chapterId,
+    chunkIndex: chunk.chunkIndex
+  }));
+
+  let signalFirstFetch;
+  let releaseFirstFetch;
+  const firstFetchStarted = new Promise((resolve) => {
+    signalFirstFetch = resolve;
+  });
+  const firstFetchGate = new Promise((resolve) => {
+    releaseFirstFetch = resolve;
+  });
+  queue.fetchAudioForChunk = async (_session, chunk) => {
+    queue.warmedChunkIds.push(chunk.chunkId);
+    if (chunk.chunkId === next.chunks[0].chunkId) {
+      signalFirstFetch();
+      await firstFetchGate;
+    }
+    return { type: "audio/wav" };
+  };
+
+  const nextPipeline = queue.ensureWarmingPipeline("warm-grow-next");
+  await firstFetchStarted;
+
+  // The current chapter grows while the next chapter is mid-synthesis.
+  const grown = buildParagraphChapter(7, {
+    chapterId: "warm-grow-current",
+    storyId: "story-priority",
+    title: "Warming Chapter"
+  });
+  await queue.saveChunkRecords(
+    grown.chunks.slice(current.chunks.length).map((chunk) => ({ ...chunk, status: "pending" }))
+  );
+  releaseFirstFetch();
+
+  assert.equal(await nextPipeline, "yielded");
+  assert.ok(queue.pendingWarmups.has("warm-grow-next"));
+
+  const currentPipeline = queue.activeWarmups.get("warm-grow-current");
+  assert.ok(currentPipeline);
+  await currentPipeline;
+  const nextResumedPipeline = queue.activeWarmups.get("warm-grow-next");
+  assert.ok(nextResumedPipeline);
+  await nextResumedPipeline;
+
+  assert.deepEqual(queue.warmedChunkIds, [
+    next.chunks[0].chunkId,
+    ...grown.chunks.slice(current.chunks.length).map((chunk) => chunk.chunkId),
+    ...next.chunks.slice(1).map((chunk) => chunk.chunkId)
+  ]);
+});
+
+test("a play request aborts the in-flight warmup fetch and warming resumes after playback starts", async () => {
+  const { chapter, queue } = buildWarmingFixture(4, "warm-play-abort");
+
+  await queue.setActiveChapterId("warm-play-abort");
+  await queue.saveSession(
+    buildPlayingSession("warm-play-abort", {
+      currentChunkId: chapter.chunks[0].chunkId,
+      totalChunks: chapter.chunks.length,
+      text: chapter.text
+    })
+  );
+
+  let fetchCalls = 0;
+  let signalFetchStarted;
+  const fetchStarted = new Promise((resolve) => {
+    signalFetchStarted = resolve;
+  });
+  queue.fetchAudioForChunk = (_session, chunk, { signal } = {}) => {
+    fetchCalls += 1;
+    queue.warmedChunkIds.push(chunk.chunkId);
+    if (fetchCalls === 1) {
+      return new Promise((_resolve, reject) => {
+        signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+        signalFetchStarted();
+      });
+    }
+    return Promise.resolve({ type: "audio/wav" });
+  };
+
+  const pipeline = queue.ensureWarmingPipeline("warm-play-abort");
+  await fetchStarted;
+
+  // A play request dispatches a live stream and cancels in-flight warming.
+  const session = await queue.loadSession("warm-play-abort");
+  await queue.saveSession({
+    ...session,
+    state: "playback_starting",
+    playbackStatus: "starting",
+    streamStatus: "connecting",
+    hasStartedPlayback: false
+  });
+  queue.interruptWarmupFetches();
+
+  assert.equal(await pipeline, "yielded");
+  assert.ok(queue.pendingWarmups.has("warm-play-abort"));
+  // The aborted chunk is retried later, not marked failed.
+  assert.equal(queue.chunkStore[1].status, "pending");
+  assert.equal(queue.audioStore.length, 0);
+
+  // Once the live stream starts playing, warming resumes automatically.
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "warm-play-abort",
+    chunkId: chapter.chunks[0].chunkId,
+    attemptId: session.playbackAttemptId
+  });
+
+  const resumedPipeline = queue.activeWarmups.get("warm-play-abort");
+  assert.ok(resumedPipeline);
+  await resumedPipeline;
+
+  assert.equal(queue.audioStore.length, chapter.chunks.length - 1);
+  for (const chunk of queue.chunkStore.slice(1)) {
+    assert.equal(chunk.status, "ready");
+  }
+});
+
 test("pause folds the playback clock and resume restarts it", async () => {
   const queue = new TestPlaybackQueue();
   queue.resumeOffscreenPlayback = async () => ({ ok: true, resumed: true, chunkId: "chapter-clock:0:h1" });
@@ -2273,4 +2472,228 @@ test("closing the prefetched tab clears the handoff record", async () => {
   await queue.handlePrefetchTabRemoved(prefetchTabId);
 
   assert.equal(await queue.loadPrefetchRecord(), null);
+});
+
+function flushAsyncWork() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+test("page warmup with sync on downloads the chapter and prefetches the next part", async () => {
+  const queue = new TestPlaybackQueue();
+  const warmedChapters = [];
+  queue.ensureWarmingPipeline = async (chapterId) => {
+    warmedChapters.push(chapterId);
+    return "completed";
+  };
+  await queue.storageArea.set({
+    "readaloud:syncStories": { "story-sync": { enabled: true, enabledAt: 1 } }
+  });
+
+  await queue.warmup({
+    ok: true,
+    text: "Sync chapter text",
+    title: "Sync Chapter 2",
+    sourceUrl: "https://www.wattpad.com/200-sync-2",
+    storyId: "story-sync",
+    partId: "200",
+    strategy: "dom-paragraphs",
+    confidence: "high",
+    nextPart: { partId: "201", url: "https://www.wattpad.com/201-sync-3", title: "" }
+  });
+  await flushAsyncWork();
+
+  assert.deepEqual(warmedChapters, ["200"]);
+  assert.equal(queue.createdTabs.length, 1);
+  assert.equal(queue.createdTabs[0].url, "https://www.wattpad.com/201-sync-3");
+  assert.equal(queue.createdTabs[0].active, false);
+});
+
+test("page warmup with sync off stays a metadata-only warmup", async () => {
+  const queue = new TestPlaybackQueue();
+  const warmedChapters = [];
+  queue.ensureWarmingPipeline = async (chapterId) => {
+    warmedChapters.push(chapterId);
+    return "completed";
+  };
+
+  await queue.warmup({
+    ok: true,
+    text: "No sync chapter text",
+    title: "No Sync Chapter",
+    sourceUrl: "https://www.wattpad.com/300-nosync",
+    storyId: "story-nosync",
+    partId: "300",
+    strategy: "dom-paragraphs",
+    confidence: "high",
+    nextPart: { partId: "301", url: "https://www.wattpad.com/301-nosync-2", title: "" }
+  });
+  await flushAsyncWork();
+
+  assert.deepEqual(warmedChapters, []);
+  assert.equal(queue.createdTabs.length, 0);
+});
+
+test("turning sync on from a mid-novel chapter downloads it, backfills chapter 1, and prefetches the next", async () => {
+  const chapterContext = {
+    kind: "chapter",
+    ok: true,
+    text: "Mid novel chapter text",
+    title: "Story - Chapter 2",
+    sourceUrl: "https://www.wattpad.com/222-story-chapter-2",
+    storyId: "story-mid",
+    partId: "222",
+    strategy: "dom-paragraphs",
+    confidence: "high",
+    firstPart: { partId: "111", url: "https://www.wattpad.com/111-story-chapter-1", title: "" },
+    nextPart: { partId: "333", url: "https://www.wattpad.com/333-story-chapter-3", title: "" }
+  };
+  const queue = new TestPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_GET_PAGE_CONTEXT") {
+        return chapterContext;
+      }
+      return { ok: true };
+    }
+  });
+  const warmedChapters = [];
+  queue.ensureWarmingPipeline = async (chapterId) => {
+    warmedChapters.push(chapterId);
+    return "completed";
+  };
+  queue.getChapterRecord = async () => null;
+
+  const response = await queue.setSyncEnabled({ enabled: true });
+  await flushAsyncWork();
+
+  assert.equal(response.ok, true);
+  assert.equal(response.storyId, "story-mid");
+  assert.equal(response.enabled, true);
+
+  const session = await queue.loadSession("222");
+  assert.equal(session.state, "startup_ready");
+  assert.ok(warmedChapters.includes("222"));
+
+  assert.deepEqual(queue.createdTabs.map((tab) => tab.url).sort(), [
+    "https://www.wattpad.com/111-story-chapter-1",
+    "https://www.wattpad.com/333-story-chapter-3"
+  ]);
+  assert.ok(queue.createdTabs.every((tab) => tab.active === false));
+
+  const syncStories = (await queue.storageArea.get("readaloud:syncStories"))["readaloud:syncStories"];
+  assert.equal(syncStories["story-mid"].enabled, true);
+});
+
+test("backfilled chapter 1 warms, chains chapter 2, and switches tabs only on play", async () => {
+  const chapterOneExtraction = {
+    ok: true,
+    text: "Chapter one text",
+    title: "Story - Chapter 1",
+    sourceUrl: "https://www.wattpad.com/111-story-chapter-1",
+    storyId: "story-novel",
+    partId: "111",
+    strategy: "dom-paragraphs",
+    confidence: "high",
+    nextPart: { partId: "222", url: "https://www.wattpad.com/222-story-chapter-2", title: "" }
+  };
+  const queue = new TestPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_EXTRACT_TEXT") {
+        return chapterOneExtraction;
+      }
+      return { ok: true };
+    }
+  });
+  const warmedChapters = [];
+  queue.ensureWarmingPipeline = async (chapterId) => {
+    warmedChapters.push(chapterId);
+    return "completed";
+  };
+  queue.getChapterRecord = async () => null;
+
+  await queue.openSyncBackfill({
+    storyId: "story-novel",
+    url: "https://www.wattpad.com/111-story-chapter-1",
+    partId: "111",
+    chainNext: true,
+    activateOnReady: true
+  });
+  const backfillTabId = queue.createdTabs[0].id;
+  assert.equal(queue.createdTabs[0].active, false);
+
+  await queue.handleBackfillTabUpdated(backfillTabId, { status: "complete" });
+  await flushAsyncWork();
+
+  const session = await queue.loadSession("111");
+  assert.equal(session.state, "startup_ready");
+  assert.equal(session.playRequested, false);
+  assert.equal(session.focusTabOnPlay, true);
+  assert.equal(await queue.getActiveChapterId(), "111");
+  assert.ok(warmedChapters.includes("111"));
+  assert.ok(queue.createdTabs.some((tab) => tab.url === "https://www.wattpad.com/222-story-chapter-2"));
+  // The backfill stays in its background tab until the user hits Play.
+  assert.equal(queue.updatedTabs.some((update) => update.tabId === backfillTabId), false);
+
+  await queue.start();
+
+  assert.ok(queue.updatedTabs.some((update) => update.tabId === backfillTabId && update.active === true));
+  assert.deepEqual(queue.startedStreams, ["111"]);
+  const playedSession = await queue.loadSession("111");
+  assert.equal(playedSession.focusTabOnPlay, false);
+});
+
+test("library uses scraped story metadata for title, author, and cover", async () => {
+  const queue = new TestPlaybackQueue();
+  const savedMetadata = [];
+  queue.saveStoryMetadataRecord = async (record) => {
+    savedMetadata.push(record);
+  };
+  queue.getStoryMetadataRecords = async () => savedMetadata;
+  queue.getLibraryOverviewRecords = async () => [
+    {
+      chapterId: "c1",
+      storyId: "story-meta",
+      title: "Raw Chapter Title 1",
+      createdAt: 1,
+      chunkCount: 2,
+      readyAudioCount: 2,
+      failedCount: 0,
+      sizeBytes: 1024
+    }
+  ];
+
+  await queue.handleStoryPageReady({
+    storyId: "story-meta",
+    title: "Proper Story Title",
+    author: "AuthorName",
+    coverUrl: "https://img.wattpad.com/cover.jpg",
+    avatarUrl: "https://img.wattpad.com/avatar.jpg",
+    sourceUrl: "https://www.wattpad.com/story/42-proper-story-title",
+    firstPart: { partId: "111", url: "https://www.wattpad.com/111-ch1", title: "" }
+  });
+
+  const library = await queue.getLibrary();
+  assert.equal(library.stories[0].title, "Proper Story Title");
+  assert.equal(library.stories[0].author, "AuthorName");
+  assert.equal(library.stories[0].coverUrl, "https://img.wattpad.com/cover.jpg");
+  assert.equal(savedMetadata[0].firstPartUrl, "https://www.wattpad.com/111-ch1");
+});
+
+test("deleting a story turns its sync off and drops its metadata", async () => {
+  const queue = new TestPlaybackQueue();
+  queue.getChapterIdsForStory = async () => [];
+  queue.getLibraryOverviewRecords = async () => [];
+  queue.getStoryMetadataRecords = async () => [];
+  const deletedMetadata = [];
+  queue.deleteStoryMetadataRecord = async (storyId) => {
+    deletedMetadata.push(storyId);
+  };
+  await queue.storageArea.set({
+    "readaloud:syncStories": { "story-gone": { enabled: true, enabledAt: 1 } }
+  });
+
+  await queue.deleteDownloadedStory("story-gone");
+
+  const syncStories = (await queue.storageArea.get("readaloud:syncStories"))["readaloud:syncStories"];
+  assert.deepEqual(syncStories, {});
+  assert.deepEqual(deletedMetadata, ["story-gone"]);
 });

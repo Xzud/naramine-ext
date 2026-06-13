@@ -80,6 +80,35 @@ test("groupLibraryByStory groups chapters per story with download counts and siz
   assert.equal(stories[1].storyId, "story-2");
 });
 
+test("groupLibraryByStory prefers scraped story metadata over title heuristics", () => {
+  const stories = groupLibraryByStory([buildChapter()], {
+    storyMetadataById: {
+      "story-1": {
+        storyId: "story-1",
+        title: "Scraped Story Title",
+        author: "Author A",
+        coverUrl: "https://img.wattpad.com/cover.jpg"
+      }
+    }
+  });
+
+  assert.equal(stories[0].title, "Scraped Story Title");
+  assert.equal(stories[0].author, "Author A");
+  assert.equal(stories[0].coverUrl, "https://img.wattpad.com/cover.jpg");
+});
+
+test("buildLibraryViewModel includes the scraped author in the story summary", () => {
+  const stories = groupLibraryByStory([buildChapter()], {
+    storyMetadataById: {
+      "story-1": { storyId: "story-1", title: "Scraped Story Title", author: "Author A" }
+    }
+  });
+  const view = buildLibraryViewModel({ stories });
+
+  assert.equal(view.stories[0].title, "Scraped Story Title");
+  assert.equal(view.stories[0].summary, "Author A · 1 of 1 chapter downloaded · 2.0 MB");
+});
+
 test("formatBytes renders human readable sizes", () => {
   assert.equal(formatBytes(0), "0 KB");
   assert.equal(formatBytes(512), "1 KB");

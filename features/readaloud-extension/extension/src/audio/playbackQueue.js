@@ -7,10 +7,13 @@ import {
   STREAM_LOOKAHEAD_DEPTH
 } from "../shared/constants.js";
 import { groupLibraryByStory } from "../shared/libraryState.js";
+import { applySyncToggle, isStorySyncEnabled, planSyncStart } from "../shared/syncState.js";
 import { chunkText, stableHash } from "../text/chunkText.js";
 import {
   cleanupExpiredAudio,
   deleteChapterData,
+  deleteStoryMetadata,
+  getAllStoryMetadata,
   getAudioChunksByChapter,
   getCacheStatus,
   getChapter,
@@ -20,6 +23,7 @@ import {
   getLibraryOverview,
   saveAudioChunk,
   saveChunks,
+  saveStoryMetadata,
   replaceChapterData,
   saveChapter,
   updateChunkStatus
@@ -43,6 +47,11 @@ import {
 const SESSION_PREFIX = "readaloud:session:";
 const ACTIVE_CHAPTER_KEY = "readaloud:activeChapterId";
 const NEXT_CHAPTER_PREFETCH_KEY = "readaloud:nextChapterPrefetch";
+const SYNC_STORIES_KEY = "readaloud:syncStories";
+const SYNC_BACKFILL_KEY = "readaloud:syncBackfill";
+const LAST_PLAYED_KEY = "readaloud:lastPlayedByStory";
+const RESUME_TARGET_KEY = "readaloud:resumeTarget";
+const LAST_PLAYED_LIMIT = 30;
 const CHAPTER_REFRESH_LOOKAHEAD = 3;
 const PREFETCH_EXTRACT_ATTEMPTS = 6;
 const PREFETCH_EXTRACT_RETRY_MS = 1000;
@@ -55,6 +64,19 @@ const PLAYBACK_RUNTIME_EVENTS = new Set([
   "STREAM_PREPARE_READY",
   "STREAM_PREPARE_ERROR"
 ]);
+// Lifecycle transitions after which yielded warmup pipelines should re-check
+// whether they can run (playback startup finished, chunk advanced, or the
+// session hit a terminal state).
+const WARMUP_RESUME_EVENTS = new Set([
+  "CHUNK_PLAYBACK_STARTED",
+  "CHUNK_PLAYBACK_ENDED",
+  "CHUNK_PLAYBACK_ERROR",
+  "CHUNK_PLAYBACK_INTERRUPTED"
+]);
+
+function isAbortError(error) {
+  return error?.name === "AbortError" || /abort/i.test(String(error));
+}
 
 export class PlaybackQueue {
   constructor(
@@ -68,6 +90,8 @@ export class PlaybackQueue {
     this.sessionTaskChain = Promise.resolve();
     this.prefetchTaskChain = Promise.resolve();
     this.activeWarmups = new Map();
+    this.pendingWarmups = new Set();
+    this.warmupFetchControllers = new Map();
     this.nextChapterPrefetchTask = null;
     this.runtimeApi.onMessage.addListener((message) => {
       if (!PLAYBACK_RUNTIME_EVENTS.has(message?.type)) {
@@ -79,9 +103,13 @@ export class PlaybackQueue {
     });
     this.tabsApi?.onUpdated?.addListener?.((tabId, changeInfo) => {
       void this.handlePrefetchTabUpdated(tabId, changeInfo).catch(() => {});
+      void this.handleBackfillTabUpdated(tabId, changeInfo).catch(() => {});
+      void this.handleResumeTabUpdated?.(tabId, changeInfo).catch(() => {});
     });
     this.tabsApi?.onRemoved?.addListener?.((tabId) => {
       void this.handlePrefetchTabRemoved(tabId).catch(() => {});
+      void this.handleBackfillTabRemoved(tabId).catch(() => {});
+      void this.handleResumeTabRemoved?.(tabId).catch(() => {});
     });
   }
 
@@ -219,7 +247,7 @@ export class PlaybackQueue {
     return updateChunkStatus(chunkId, status);
   }
 
-  async fetchAudioForChunk(session, chunk) {
+  async fetchAudioForChunk(session, chunk, { signal = null } = {}) {
     const provider = this.getProvider(session);
     const request = provider.createStreamRequest({
       text: chunk.text,
@@ -229,7 +257,8 @@ export class PlaybackQueue {
     const response = await fetch(request.url, {
       method: request.method || "POST",
       headers: request.headers || {},
-      body: request.body
+      body: request.body,
+      signal
     });
     if (!response.ok) {
       throw new Error(`Warmup synthesis failed: ${response.status}`);
@@ -239,6 +268,34 @@ export class PlaybackQueue {
 
   isWarmableSession(session) {
     return Boolean(session) && Boolean(session.text) && !session.stopped && session.state !== "error";
+  }
+
+  // A play request whose live stream has not produced audio yet. While this
+  // is true the TTS backend belongs to the live stream, not warming.
+  isPlaybackStartupInFlight(session) {
+    if (!session || session.paused || session.stopped || !session.playRequested) {
+      return false;
+    }
+    return (
+      session.state === "playback_starting" ||
+      session.playbackStatus === "dispatching" ||
+      session.playbackStatus === "starting" ||
+      session.streamStatus === "connecting"
+    );
+  }
+
+  // Sessions that never started playing warm from the top (so the chapter can
+  // become a complete download); playing sessions only warm ahead of the
+  // playhead.
+  getWarmupFloorIndex(session) {
+    if (!session.hasStartedPlayback && !session.playRequested) {
+      return -1;
+    }
+    return typeof session.currentChunkIndex === "number" ? session.currentChunkIndex : -1;
+  }
+
+  async hasWarmableChunk(chapterId, session) {
+    return Boolean(await this.findNextChunkToWarm(chapterId, this.getWarmupFloorIndex(session)));
   }
 
   async findNextChunkToWarm(chapterId, fromChunkIndex) {
@@ -255,6 +312,55 @@ export class PlaybackQueue {
     );
   }
 
+  // Decides whether a chapter's pipeline may synthesize right now. "yield"
+  // parks the pipeline in pendingWarmups until resumePendingWarmups re-kicks
+  // it: the live stream's startup always wins, and the active chapter must be
+  // fully warm before any other chapter (the prefetched next one) proceeds.
+  async resolveWarmupGate(chapterId) {
+    const activeChapterId = await this.getActiveChapterId();
+    const activeSession = await this.loadSession(activeChapterId);
+
+    if (this.isPlaybackStartupInFlight(activeSession)) {
+      return "yield";
+    }
+
+    if (
+      chapterId !== activeChapterId &&
+      this.isWarmableSession(activeSession) &&
+      (await this.hasWarmableChunk(activeChapterId, activeSession))
+    ) {
+      void this.ensureWarmingPipeline(activeChapterId);
+      return "yield";
+    }
+
+    return "proceed";
+  }
+
+  // Re-kicks pipelines that yielded. Called when a pipeline finishes (the
+  // next chapter resumes once the current one is warm), after playback
+  // lifecycle events (startup finished or failed), and on pause/stop.
+  resumePendingWarmups(excludeChapterId = null) {
+    for (const chapterId of [...this.pendingWarmups]) {
+      if (chapterId === excludeChapterId) {
+        continue;
+      }
+      this.pendingWarmups.delete(chapterId);
+      void this.ensureWarmingPipeline(chapterId);
+    }
+  }
+
+  // Cancels in-flight warmup synthesis so a fresh play request does not queue
+  // behind it at the TTS backend. Aborted chunks stay pending and are
+  // retried once the pipeline's gate clears.
+  interruptWarmupFetches({ exceptChapterId = null } = {}) {
+    for (const [chapterId, controller] of this.warmupFetchControllers) {
+      if (exceptChapterId !== null && chapterId === exceptChapterId) {
+        continue;
+      }
+      controller.abort();
+    }
+  }
+
   // Continuously synthesizes chunks ahead of the playhead into the IndexedDB
   // audio cache, one at a time, until the chapter tail is warm. Single-flight
   // per chapter; safe to invoke from anywhere because it never writes the
@@ -262,16 +368,21 @@ export class PlaybackQueue {
   // chapter grows (lazy-loaded pages) resumes warming the new tail.
   ensureWarmingPipeline(chapterId) {
     if (!chapterId) {
-      return Promise.resolve();
+      return Promise.resolve("skipped");
     }
     const existing = this.activeWarmups.get(chapterId);
     if (existing) {
       return existing;
     }
+    this.pendingWarmups.delete(chapterId);
     const pipeline = this.runWarmingPipeline(chapterId)
-      .catch(() => {})
-      .finally(() => {
+      .catch(() => "errored")
+      .then((outcome) => {
         this.activeWarmups.delete(chapterId);
+        if (outcome !== "yielded") {
+          this.resumePendingWarmups(chapterId);
+        }
+        return outcome;
       });
     this.activeWarmups.set(chapterId, pipeline);
     return pipeline;
@@ -282,18 +393,26 @@ export class PlaybackQueue {
     while (true) {
       const session = await this.loadSession(chapterId);
       if (!this.isWarmableSession(session)) {
-        return;
+        return "completed";
       }
 
-      const fromChunkIndex = typeof session.currentChunkIndex === "number" ? session.currentChunkIndex : -1;
-      const chunk = await this.findNextChunkToWarm(chapterId, fromChunkIndex);
+      const chunk = await this.findNextChunkToWarm(chapterId, this.getWarmupFloorIndex(session));
       if (!chunk || attemptedChunkIds.has(chunk.chunkId)) {
-        return;
+        return "completed";
       }
-      attemptedChunkIds.add(chunk.chunkId);
 
+      const gate = await this.resolveWarmupGate(chapterId);
+      if (gate !== "proceed") {
+        this.pendingWarmups.add(chapterId);
+        this.log("warmup_yielded", session, { chapterId, chunkId: chunk.chunkId });
+        return "yielded";
+      }
+
+      attemptedChunkIds.add(chunk.chunkId);
+      const controller = new AbortController();
+      this.warmupFetchControllers.set(chapterId, controller);
       try {
-        const blob = await this.fetchAudioForChunk(session, chunk);
+        const blob = await this.fetchAudioForChunk(session, chunk, { signal: controller.signal });
         await this.saveAudioRecord({
           chunkId: chunk.chunkId,
           chapterId,
@@ -304,8 +423,19 @@ export class PlaybackQueue {
         });
         await this.markChunkStatus(chunk.chunkId, "ready");
       } catch (error) {
+        if (controller.signal.aborted || isAbortError(error)) {
+          // Interrupted so a play request gets the backend immediately; leave
+          // the chunk pending and let the gate decide when to retry it.
+          attemptedChunkIds.delete(chunk.chunkId);
+          this.log("warmup_chunk_interrupted", session, { chunkId: chunk.chunkId });
+          continue;
+        }
         await this.markChunkStatus(chunk.chunkId, "failed").catch(() => {});
         this.log("warmup_chunk_failed", session, { chunkId: chunk.chunkId, error: String(error) });
+      } finally {
+        if (this.warmupFetchControllers.get(chapterId) === controller) {
+          this.warmupFetchControllers.delete(chapterId);
+        }
       }
     }
   }
@@ -342,6 +472,17 @@ export class PlaybackQueue {
       return tabs[0]?.id ?? null;
     } catch (_error) {
       return null;
+    }
+  }
+
+  async focusSessionTab(session) {
+    if (typeof this.tabsApi?.update !== "function" || typeof session?.tabId !== "number") {
+      return;
+    }
+    try {
+      await this.tabsApi.update(session.tabId, { active: true });
+    } catch (_error) {
+      // The tab may have been closed; playback does not require it focused.
     }
   }
 
@@ -550,6 +691,10 @@ export class PlaybackQueue {
 
     await this.mergeChapterChunkData(refreshedSession, chapter, chunks, existingChunks);
     await this.saveSession(refreshedSession);
+    // The chapter grew, so the current chapter has unwarmed chunks again; pull
+    // the backend away from any other chapter (the prefetched next one) now
+    // instead of waiting for its current chunk to finish synthesizing.
+    this.interruptWarmupFetches({ exceptChapterId: refreshedSession.chapterId });
     void this.ensureWarmingPipeline(refreshedSession.chapterId);
     if (resumePlayback) {
       await this.processSession(refreshedSession.chapterId);
@@ -853,6 +998,7 @@ export class PlaybackQueue {
       };
       await this.saveSession(startedSession);
       await this.ensureOffscreenDocument();
+      this.interruptWarmupFetches();
       await this.processSession(record.nextChapterId);
     });
 
@@ -860,6 +1006,279 @@ export class PlaybackQueue {
 
     await this.cleanupChapter(record.fromChapterId, record.fromTabId, { keepTabId: record.tabId });
     return true;
+  }
+
+  async loadSyncStories() {
+    const values = await this.storageArea.get(SYNC_STORIES_KEY);
+    return values[SYNC_STORIES_KEY] || {};
+  }
+
+  async saveSyncStories(syncStories) {
+    await this.storageArea.set({ [SYNC_STORIES_KEY]: syncStories });
+  }
+
+  async isSyncEnabled(storyId) {
+    return isStorySyncEnabled(await this.loadSyncStories(), storyId);
+  }
+
+  // Asks the page what it is: a chapter (returns the full extraction), a
+  // story overview (returns scraped metadata), or neither. The popup has no
+  // page access of its own, so sync requests route through here.
+  async getPageContext(tabId = null) {
+    let resolvedTabId = typeof tabId === "number" ? tabId : null;
+    if (resolvedTabId === null && typeof this.tabsApi?.query === "function") {
+      try {
+        const tabs = await this.tabsApi.query({ active: true, currentWindow: true });
+        resolvedTabId = tabs[0]?.id ?? null;
+      } catch (_error) {
+        resolvedTabId = null;
+      }
+    }
+    if (typeof resolvedTabId !== "number") {
+      return { kind: "none", ok: false };
+    }
+
+    const context = await this.sendPageCommand(resolvedTabId, { type: "READALOUD_GET_PAGE_CONTEXT" });
+    if (!context || typeof context !== "object" || !context.kind) {
+      return { kind: "none", ok: false };
+    }
+    return { ...context, tabId: resolvedTabId };
+  }
+
+  async getSyncStatus(payload = {}) {
+    const context = await this.getPageContext(typeof payload.tabId === "number" ? payload.tabId : null);
+    const storyId = payload.storyId || context.storyId || null;
+    if (!storyId) {
+      return { ok: false, storyId: null, enabled: false, kind: context.kind };
+    }
+    return { ok: true, storyId, enabled: await this.isSyncEnabled(storyId), kind: context.kind };
+  }
+
+  async setSyncEnabled(payload = {}) {
+    const context = await this.getPageContext(typeof payload.tabId === "number" ? payload.tabId : null);
+    const storyId = payload.storyId || context.storyId || null;
+    if (!storyId) {
+      return { ok: false, storyId: null, enabled: false, kind: context.kind, error: "no_story_context" };
+    }
+
+    const enabled = Boolean(payload.enabled);
+    await this.saveSyncStories(applySyncToggle(await this.loadSyncStories(), storyId, enabled));
+    this.log(enabled ? "sync_enabled" : "sync_disabled", {}, { storyId, kind: context.kind });
+
+    if (enabled && context.storyId === storyId && context.kind !== "none") {
+      await this.startSyncFromContext(context).catch((error) => {
+        this.log("sync_start_failed", {}, { storyId, error: String(error) });
+      });
+    }
+    return { ok: true, storyId, enabled, kind: context.kind };
+  }
+
+  // Runs the Sync-On kickoff ordering from the page the user toggled on:
+  // the focused chapter, then a chapter-1 backfill, then the next chapter.
+  async startSyncFromContext(context) {
+    if (context.kind === "story") {
+      await this.handleStoryPageReady(context).catch(() => {});
+    }
+
+    for (const step of planSyncStart(context)) {
+      if (step.action === "warm-current") {
+        // warmup notices the now-enabled sync flag and starts the download
+        // pipeline plus the next-chapter prefetch itself.
+        await this.warmup({ ...context, tabId: context.tabId ?? null });
+      } else if (step.action === "backfill") {
+        await this.openSyncBackfill({
+          storyId: context.storyId || null,
+          url: step.url,
+          partId: step.partId,
+          chainNext: step.chainNext,
+          activateOnReady: step.activateOnReady
+        });
+      } else if (step.action === "prefetch-next") {
+        const session = await this.loadSession(context.partId);
+        if (session) {
+          void this.ensureNextChapterPrefetch(session);
+        }
+      }
+    }
+  }
+
+  // With Sync on for the story, every visited chapter downloads fully and
+  // the next chapter prefetches behind it; the warmup gate keeps the focused
+  // chapter ahead of the prefetched one. The frontier therefore follows the
+  // user: N+2 stays unreachable until they actually reach N+1.
+  async maybeStartStorySync(session) {
+    if (!session?.chapterId || !(await this.isSyncEnabled(session.storyId))) {
+      return false;
+    }
+    void this.ensureWarmingPipeline(session.chapterId);
+    void this.ensureNextChapterPrefetch(session);
+    return true;
+  }
+
+  async loadBackfillRecord() {
+    const values = await this.storageArea.get(SYNC_BACKFILL_KEY);
+    return values[SYNC_BACKFILL_KEY] || null;
+  }
+
+  async saveBackfillRecord(record) {
+    await this.storageArea.set({ [SYNC_BACKFILL_KEY]: record });
+  }
+
+  async clearBackfillRecord() {
+    if (typeof this.storageArea.remove === "function") {
+      await this.storageArea.remove(SYNC_BACKFILL_KEY);
+      return;
+    }
+    await this.storageArea.set({ [SYNC_BACKFILL_KEY]: null });
+  }
+
+  // Opens the story's first chapter in a background tab so a user who turned
+  // Sync on mid-novel also gets the beginning. Single slot: only chapter 1
+  // is ever backfilled, and re-triggering while one runs is a no-op. Shares
+  // the prefetch lock because both records are low-traffic tab lifecycles.
+  async openSyncBackfill({ storyId, url, partId = null, chainNext = false, activateOnReady = false }) {
+    if (!url || typeof this.tabsApi?.create !== "function") {
+      return false;
+    }
+    if (partId && (await this.getChapterRecord(partId))) {
+      return false;
+    }
+
+    return this.runPrefetchExclusive(async () => {
+      const record = await this.loadBackfillRecord();
+      if (record && record.url === url && record.status !== "failed" && (await this.prefetchTabExists(record.tabId))) {
+        return true;
+      }
+
+      const tab = await this.tabsApi.create({ url, active: false });
+      await this.saveBackfillRecord({
+        storyId: storyId || null,
+        url,
+        partId,
+        tabId: tab?.id ?? null,
+        status: "opening",
+        chainNext,
+        activateOnReady,
+        createdAt: Date.now()
+      });
+      this.log("sync_backfill_opened", {}, { url, tabId: tab?.id ?? null });
+      return true;
+    });
+  }
+
+  async handleBackfillTabUpdated(tabId, changeInfo) {
+    if (changeInfo?.status !== "complete") {
+      return;
+    }
+
+    const claimedRecord = await this.runPrefetchExclusive(async () => {
+      const record = await this.loadBackfillRecord();
+      if (!record || record.tabId !== tabId || record.status !== "opening") {
+        return null;
+      }
+      const warmingRecord = { ...record, status: "warming" };
+      await this.saveBackfillRecord(warmingRecord);
+      return warmingRecord;
+    });
+
+    if (claimedRecord) {
+      await this.processBackfillTab(claimedRecord);
+    }
+  }
+
+  async handleBackfillTabRemoved(tabId) {
+    await this.runPrefetchExclusive(async () => {
+      const record = await this.loadBackfillRecord();
+      if (record && record.tabId === tabId) {
+        await this.clearBackfillRecord();
+      }
+    });
+  }
+
+  // Scans the backfill tab like a prefetched chapter: extract, store a warm
+  // session, and start its download. activateOnReady covers the novel-page
+  // trigger, where Play in the popup should start chapter 1 (and only then
+  // switch to its tab); chainNext covers chapter 2 syncing behind it.
+  async processBackfillTab(record) {
+    const extraction = await this.extractFromTabWithRetry(record.tabId);
+    if (!extraction?.ok || !extraction.text) {
+      await this.runPrefetchExclusive(async () => {
+        const latest = await this.loadBackfillRecord();
+        if (latest && latest.tabId === record.tabId) {
+          await this.saveBackfillRecord({
+            ...latest,
+            status: "failed",
+            error: extraction?.error || "backfill_extract_failed"
+          });
+        }
+      });
+      this.log("sync_backfill_extract_failed", {}, { tabId: record.tabId, error: extraction?.error || null });
+      return;
+    }
+
+    const chapterId = await this.warmupPrefetchedChapter(record, extraction);
+    if (!chapterId) {
+      return;
+    }
+
+    await this.runPrefetchExclusive(async () => {
+      const latest = await this.loadBackfillRecord();
+      if (latest && latest.tabId === record.tabId) {
+        await this.saveBackfillRecord({ ...latest, chapterId, status: "ready" });
+      }
+    });
+    this.log("sync_backfill_ready", {}, { chapterId, tabId: record.tabId });
+
+    if (record.activateOnReady) {
+      await this.setActiveChapterId(chapterId);
+      await this.runExclusive(async () => {
+        const session = await this.loadSession(chapterId);
+        if (session) {
+          await this.saveSession({ ...session, focusTabOnPlay: true });
+        }
+      });
+    }
+
+    void this.ensureWarmingPipeline(chapterId);
+
+    if (record.chainNext) {
+      const session = await this.loadSession(chapterId);
+      if (session?.nextPartUrl) {
+        void this.ensureNextChapterPrefetch(session);
+      }
+    }
+  }
+
+  // Novel-page visits only record metadata (name, cover, author, avatar);
+  // downloads start from chapter visits or the Sync-On trigger.
+  async handleStoryPageReady(payload = {}) {
+    if (!payload?.storyId) {
+      return { ok: false, error: "missing_story_id" };
+    }
+    await this.saveStoryMetadataRecord({
+      storyId: payload.storyId,
+      title: payload.title || "",
+      author: payload.author || "",
+      coverUrl: payload.coverUrl || "",
+      avatarUrl: payload.avatarUrl || "",
+      sourceUrl: payload.sourceUrl || "",
+      firstPartId: payload.firstPart?.partId || null,
+      firstPartUrl: payload.firstPart?.url || null,
+      updatedAt: Date.now()
+    });
+    return { ok: true, storyId: payload.storyId };
+  }
+
+  async saveStoryMetadataRecord(record) {
+    return saveStoryMetadata(record);
+  }
+
+  async getStoryMetadataRecords() {
+    return getAllStoryMetadata();
+  }
+
+  async deleteStoryMetadataRecord(storyId) {
+    return deleteStoryMetadata(storyId);
   }
 
   // Drops the live resources owned by a finished chapter: its tab and its
@@ -894,15 +1313,18 @@ export class PlaybackQueue {
   }
 
   async getLibrary() {
-    const [overview, activeChapterId] = await Promise.all([
+    const [overview, activeChapterId, storyMetadata] = await Promise.all([
       this.getLibraryOverviewRecords(),
-      this.getActiveChapterId()
+      this.getActiveChapterId(),
+      this.getStoryMetadataRecords().catch(() => [])
     ]);
     return {
       ok: true,
       stories: groupLibraryByStory(overview, {
-        warmingChapterIds: [...this.activeWarmups.keys()],
-        activeChapterId
+        // Yielded pipelines are still queued work, so they read as processing.
+        warmingChapterIds: [...this.activeWarmups.keys(), ...this.pendingWarmups],
+        activeChapterId,
+        storyMetadataById: Object.fromEntries((storyMetadata || []).map((record) => [record.storyId, record]))
       })
     };
   }
@@ -918,6 +1340,9 @@ export class PlaybackQueue {
     if (!chapterId) {
       return;
     }
+
+    this.pendingWarmups.delete(chapterId);
+    this.warmupFetchControllers.get(chapterId)?.abort();
 
     const [session, activeChapterId] = await Promise.all([this.loadSession(chapterId), this.getActiveChapterId()]);
     if (session && !session.stopped && chapterId === activeChapterId) {
@@ -936,6 +1361,10 @@ export class PlaybackQueue {
           await this.deleteDownloadedChapterExclusive(chapterId);
         }
       });
+      // Deleting a novel also turns its sync off; re-syncing is an explicit
+      // (re-charged) user action, not something an open tab should restart.
+      await this.saveSyncStories(applySyncToggle(await this.loadSyncStories(), storyId, false));
+      await this.deleteStoryMetadataRecord(storyId).catch(() => {});
     }
     return this.getLibrary();
   }
@@ -1029,6 +1458,7 @@ export class PlaybackQueue {
 
     await this.saveSession(nextSession);
     await this.focusChunkOnPage(nextSession, targetChunk.chunkId, { clearPrevious: true }).catch(() => {});
+    this.interruptWarmupFetches();
     await this.stopOffscreenPlayback();
     await this.processSession(chapterId);
     return this.getState(chapterId);
@@ -1352,9 +1782,16 @@ export class PlaybackQueue {
             streamStatus: wasPaused ? "idle" : existingSession.streamStatus,
             lastEvent: "play_requested"
           };
+      if (existingSession.focusTabOnPlay) {
+        // A backfilled chapter 1 lives in a background tab; the spec switches
+        // to it only when the user actually hits Play.
+        resumedWarmSession.focusTabOnPlay = false;
+        await this.focusSessionTab(resumedWarmSession);
+      }
       await this.ensureChapterData(resumedWarmSession);
       await this.saveSession(resumedWarmSession);
       await this.ensureOffscreenDocument();
+      this.interruptWarmupFetches();
       await this.processSession(activeChapterId);
       return this.getState(activeChapterId);
     }
@@ -1376,6 +1813,7 @@ export class PlaybackQueue {
     await this.ensureOffscreenDocument();
     await this.ensureChapterData(nextSession);
     await this.saveSession(nextSession);
+    this.interruptWarmupFetches();
     await this.processSession(chapterId);
 
     return this.getState(chapterId);
@@ -1421,6 +1859,7 @@ export class PlaybackQueue {
           };
       await this.ensureChapterData(resumedWarmSession);
       await this.saveSession(resumedWarmSession);
+      await this.maybeStartStorySync(resumedWarmSession);
       return this.getState(chapterId);
     }
 
@@ -1434,6 +1873,7 @@ export class PlaybackQueue {
     await this.ensureOffscreenDocument();
     await this.ensureChapterData(nextSession);
     await this.saveSession(nextSession);
+    await this.maybeStartStorySync(nextSession);
 
     return this.getState(chapterId);
   }
@@ -1460,6 +1900,8 @@ export class PlaybackQueue {
     };
     await this.saveSession(pausedSession);
     await this.runtimeApi.sendMessage({ type: "PAUSE_PLAYBACK" });
+    // Pause ends any playback startup, so parked warmups may run again.
+    this.resumePendingWarmups();
     return this.getState(resolvedChapterId);
   }
 
@@ -1485,6 +1927,7 @@ export class PlaybackQueue {
       await this.clearChunkFocus(stoppedSession).catch(() => {});
     }
     await this.runtimeApi.sendMessage({ type: "STOP_PLAYBACK" });
+    this.resumePendingWarmups();
     return this.getState(resolvedChapterId);
   }
 
@@ -1706,6 +2149,9 @@ export class PlaybackQueue {
 
   async handleRuntimeMessage(message) {
     const followUp = await this.runExclusive(() => this.handleRuntimeMessageExclusive(message));
+    if (WARMUP_RESUME_EVENTS.has(message?.type)) {
+      this.resumePendingWarmups();
+    }
     if (followUp?.refreshSession) {
       await this.refreshChapterDataFromPage(followUp.refreshSession, { resumePlayback: true }).catch(() => {});
     }

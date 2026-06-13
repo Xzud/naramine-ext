@@ -56,6 +56,10 @@ export function openDb() {
         audioChunks.createIndex("chapterId_chunkIndex", ["chapterId", "chunkIndex"], { unique: true });
         audioChunks.createIndex("expiresAt", "expiresAt", { unique: false });
       }
+
+      if (!db.objectStoreNames.contains("stories")) {
+        db.createObjectStore("stories", { keyPath: "storyId" });
+      }
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error);
@@ -226,6 +230,22 @@ export async function getLibraryOverview() {
       })
     );
   });
+}
+
+export async function saveStoryMetadata(record) {
+  return withTransaction(["stories"], "readwrite", ({ stories }) => promisifyRequest(stories.put(record)));
+}
+
+export async function getStoryMetadata(storyId) {
+  return withTransaction(["stories"], "readonly", ({ stories }) => promisifyRequest(stories.get(storyId)));
+}
+
+export async function getAllStoryMetadata() {
+  return withTransaction(["stories"], "readonly", ({ stories }) => promisifyRequest(stories.getAll()));
+}
+
+export async function deleteStoryMetadata(storyId) {
+  return withTransaction(["stories"], "readwrite", ({ stories }) => promisifyRequest(stories.delete(storyId)));
 }
 
 export async function getChapterIdsByStory(storyId) {

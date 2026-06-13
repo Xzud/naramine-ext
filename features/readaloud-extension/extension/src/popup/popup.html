@@ -173,6 +173,45 @@
         background: var(--played);
       }
 
+      .sync-toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 2px;
+        border: 1px solid #3a3a3a;
+        border-radius: 999px;
+        background: transparent;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        padding: 4px 11px;
+        cursor: pointer;
+        transition: color 120ms ease, border-color 120ms ease;
+      }
+
+      .sync-toggle:hover {
+        color: var(--text);
+        border-color: var(--muted);
+      }
+
+      .sync-toggle[hidden] {
+        display: none;
+      }
+
+      .sync-toggle .sync-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: currentColor;
+      }
+
+      .sync-toggle.on,
+      .sync-toggle.on:hover {
+        color: #58d68d;
+        border-color: rgba(88, 214, 141, 0.5);
+      }
+
       .error {
         margin: -10px 0 0;
         width: 100%;
@@ -227,6 +266,7 @@
       .library {
         display: flex;
         flex-direction: column;
+        align-items: stretch;
         gap: 12px;
         padding: 14px 14px 16px;
       }
@@ -285,6 +325,15 @@
 
       .story[open] .story-caret {
         transform: rotate(90deg);
+      }
+
+      .story-cover {
+        flex: none;
+        width: 26px;
+        height: 34px;
+        border-radius: 4px;
+        object-fit: cover;
+        background: #222222;
       }
 
       .story-heading {
@@ -440,6 +489,9 @@
       <div class="heading">
         <p class="eyebrow">Read Aloud</p>
         <h1 id="title">Read Aloud</h1>
+        <button id="syncToggle" class="sync-toggle" hidden aria-pressed="false">
+          <span class="sync-dot" aria-hidden="true"></span><span id="syncLabel">Sync off</span>
+        </button>
       </div>
 
       <div class="controls">
@@ -476,7 +528,7 @@
       </header>
       <div id="libraryList" class="library-list"></div>
       <p id="libraryEmpty" class="library-empty" hidden>
-        No downloaded audio yet. Chapters are saved here automatically as they are warmed up during playback.
+        No downloaded audio yet. Chapters are saved here automatically as they play, or as you read with Sync on.
       </p>
     </main>
     <script type="module" src="./popup.js"></script>

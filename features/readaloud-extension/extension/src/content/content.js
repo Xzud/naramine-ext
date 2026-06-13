@@ -471,6 +471,36 @@ function findNextPartFromHtml(value, currentPartId = null) {
   return null;
 }
 
+// Locates the story's first part so a mid-novel Sync-On can backfill chapter
+// 1. The embedded "firstPartId" is the reliable source; the first part-shaped
+// link in the page (the table of contents starts with part 1) is a
+// best-effort fallback, and callers skip the backfill when neither matches.
+function findFirstPartFromHtml(value) {
+  const idMatch = value.match(/"firstPartId":\s*"?(\d+)"?/i);
+  if (idMatch) {
+    const partId = idMatch[1];
+    const hrefMatch = value.match(new RegExp(`href="(/${partId}-[^"]*)"`, "i"));
+    return {
+      partId,
+      url: hrefMatch
+        ? `https://www.wattpad.com${decodeHtmlEntities(hrefMatch[1])}`
+        : `https://www.wattpad.com/${partId}`,
+      title: ""
+    };
+  }
+
+  const firstLink = value.match(/<a\b[^>]*href="(\/(\d+)-[^"]*)"[^>]*>/i);
+  if (firstLink) {
+    return {
+      partId: firstLink[2],
+      url: `https://www.wattpad.com${decodeHtmlEntities(firstLink[1])}`,
+      title: ""
+    };
+  }
+
+  return null;
+}
+
 function isWattpadReadingDocument(documentRef) {
   const hostname = documentRef.location?.hostname || "";
   if (!hostname.includes("wattpad.com")) {
@@ -534,6 +564,7 @@ function extractWattpadTextFromDocument(documentRef) {
 
     if (domResult.ok) {
       domResult.nextPart = findNextPartFromHtml(documentRef.documentElement.outerHTML, domResult.partId);
+      domResult.firstPart = findFirstPartFromHtml(documentRef.documentElement.outerHTML);
       return domResult;
     }
   }
@@ -541,31 +572,107 @@ function extractWattpadTextFromDocument(documentRef) {
   const embeddedResult = extractEmbeddedStoryTextFromHtml(documentRef.documentElement.outerHTML, metadata);
   if (embeddedResult.ok) {
     embeddedResult.nextPart = findNextPartFromHtml(documentRef.documentElement.outerHTML, embeddedResult.partId);
+    embeddedResult.firstPart = findFirstPartFromHtml(documentRef.documentElement.outerHTML);
   }
   return embeddedResult;
 }
 
+function isWattpadStoryOverviewDocument(documentRef) {
+  const hostname = documentRef.location?.hostname || "";
+  if (!hostname.includes("wattpad.com") || isWattpadReadingDocument(documentRef)) {
+    return false;
+  }
+
+  return /^\/story\/\d+/i.test(documentRef.location?.pathname || "");
+}
+
+function getMetaContent(documentRef, property) {
+  return (
+    documentRef.querySelector?.(`meta[property="${property}"]`)?.getAttribute?.("content") ||
+    documentRef.querySelector?.(`meta[name="${property}"]`)?.getAttribute?.("content") ||
+    ""
+  );
+}
+
+function stripWattpadTitleSuffix(value) {
+  return (value || "").replace(/\s*[-|–]\s*Wattpad\s*$/i, "").trim();
+}
+
+function extractWattpadStoryInfoFromDocument(documentRef) {
+  const sourceUrl = documentRef.location?.href || "";
+  const html = documentRef.documentElement?.outerHTML || "";
+  const storyId = findStoryId(html, sourceUrl);
+  if (!storyId) {
+    return { ok: false, error: "story_id_not_found", storyId: null, sourceUrl };
+  }
+
+  const author =
+    documentRef.querySelector?.('a[href^="/user/"]')?.textContent?.trim() ||
+    decodeEscapedJsonString(html.match(/"username":"((?:[^"\\]|\\.)*)"/i)?.[1] || "");
+  const avatarUrl = decodeEscapedJsonString(html.match(/"avatar":"((?:[^"\\]|\\.)*)"/i)?.[1] || "");
+
+  return {
+    ok: true,
+    storyId,
+    title: stripWattpadTitleSuffix(getMetaContent(documentRef, "og:title") || documentRef.title || ""),
+    author,
+    coverUrl: getMetaContent(documentRef, "og:image") || "",
+    avatarUrl,
+    sourceUrl,
+    firstPart: findFirstPartFromHtml(html)
+  };
+}
+
+function getPageContext(documentRef) {
+  if (isWattpadReadingDocument(documentRef)) {
+    return { kind: "chapter", ...extractWattpadTextFromDocument(documentRef) };
+  }
+  if (isWattpadStoryOverviewDocument(documentRef)) {
+    return { kind: "story", ...extractWattpadStoryInfoFromDocument(documentRef) };
+  }
+  return { kind: "none", ok: false };
+}
+
 function notifyPageReady(documentRef) {
-  if (!isWattpadReadingDocument(documentRef) || documentRef.visibilityState !== "visible") {
+  if (documentRef.visibilityState !== "visible") {
     return;
   }
 
-  chrome.runtime
-    .sendMessage({
-      scope: "readaloud",
-      type: "PAGE_READY",
-      payload: {
-        ...extractWattpadTextFromDocument(documentRef),
-        pageDetected: true,
-        pageEligible: true,
-        autoplayAllowed: false,
-        pageVisible: true,
-        detectedAt: Date.now()
-      }
-    })
-    .catch(() => {
-      // Best-effort warmup signal; popup-driven flows can still recover.
-    });
+  if (isWattpadReadingDocument(documentRef)) {
+    chrome.runtime
+      .sendMessage({
+        scope: "readaloud",
+        type: "PAGE_READY",
+        payload: {
+          ...extractWattpadTextFromDocument(documentRef),
+          pageDetected: true,
+          pageEligible: true,
+          autoplayAllowed: false,
+          pageVisible: true,
+          detectedAt: Date.now()
+        }
+      })
+      .catch(() => {
+        // Best-effort warmup signal; popup-driven flows can still recover.
+      });
+    return;
+  }
+
+  if (isWattpadStoryOverviewDocument(documentRef)) {
+    const storyInfo = extractWattpadStoryInfoFromDocument(documentRef);
+    if (!storyInfo.ok) {
+      return;
+    }
+    chrome.runtime
+      .sendMessage({
+        scope: "readaloud",
+        type: "STORY_PAGE_READY",
+        payload: storyInfo
+      })
+      .catch(() => {
+        // Best-effort metadata; the library falls back to title heuristics.
+      });
+  }
 }
 
 function getPageSignature(documentRef) {
@@ -624,6 +731,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "READALOUD_CLEAR_ACTIVE_CHUNK") {
       chunkFocus.clear();
       sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message?.type === "READALOUD_GET_PAGE_CONTEXT") {
+      sendResponse(getPageContext(document));
       return true;
     }
 

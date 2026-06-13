@@ -89,7 +89,14 @@ export function buildLibraryViewModel(library) {
     stories: stories.map((story) => ({
       storyId: story.storyId,
       title: story.title || "Unknown story",
-      summary: `${story.downloadedCount} of ${story.chapterCount} chapter${story.chapterCount === 1 ? "" : "s"} downloaded · ${formatBytes(story.sizeBytes)}`,
+      author: story.author || "",
+      coverUrl: story.coverUrl || "",
+      summary: [
+        story.author || null,
+        `${story.downloadedCount} of ${story.chapterCount} chapter${story.chapterCount === 1 ? "" : "s"} downloaded · ${formatBytes(story.sizeBytes)}`
+      ]
+        .filter(Boolean)
+        .join(" · "),
       chapters: story.chapters.map((chapter) => ({
         chapterId: chapter.chapterId,
         title: chapter.title || "Untitled chapter",

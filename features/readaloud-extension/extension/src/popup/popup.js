@@ -13,6 +13,7 @@ let lastState = null;
 let lastLibrarySignature = null;
 let libraryOpen = false;
 let confirmResetTimer = null;
+let syncStatus = null;
 
 async function request(type, payload = {}) {
   try {
@@ -94,6 +95,14 @@ function renderStory(story, openStoryIds) {
   const summary = document.createElement("summary");
   summary.innerHTML =
     '<svg class="story-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M9.3 6.3a1 1 0 0 1 1.4 0l5 5a1 1 0 0 1 0 1.4l-5 5a1 1 0 1 1-1.4-1.4L13.58 12 9.3 7.7a1 1 0 0 1 0-1.4Z" /></svg>';
+
+  if (story.coverUrl) {
+    const cover = document.createElement("img");
+    cover.className = "story-cover";
+    cover.src = story.coverUrl;
+    cover.alt = "";
+    summary.append(cover);
+  }
 
   const heading = document.createElement("div");
   heading.className = "story-heading";
@@ -201,6 +210,29 @@ async function refreshState() {
   }
 }
 
+function renderSyncToggle() {
+  const button = document.getElementById("syncToggle");
+  if (!button) {
+    return;
+  }
+  const available = Boolean(syncStatus?.ok && syncStatus.storyId);
+  button.hidden = !available;
+  if (!available) {
+    return;
+  }
+  const enabled = Boolean(syncStatus.enabled);
+  button.classList.toggle("on", enabled);
+  button.setAttribute("aria-pressed", String(enabled));
+  document.getElementById("syncLabel").textContent = enabled ? "Sync on" : "Sync off";
+}
+
+// The page (and therefore the story under the toggle) cannot change while
+// the popup stays open, so one fetch at open plus updates on click suffice.
+async function refreshSync() {
+  syncStatus = await request("SYNC_GET");
+  renderSyncToggle();
+}
+
 document.getElementById("play")?.addEventListener("click", async () => {
   lastState = await request(isPauseable(lastState) ? "PAUSE" : "PLAY");
   render();
@@ -209,6 +241,23 @@ document.getElementById("play")?.addEventListener("click", async () => {
 document.getElementById("stop")?.addEventListener("click", async () => {
   lastState = await request("STOP");
   render();
+});
+
+document.getElementById("syncToggle")?.addEventListener("click", async () => {
+  if (!syncStatus?.storyId) {
+    return;
+  }
+  const button = document.getElementById("syncToggle");
+  button.disabled = true;
+  const response = await request("SYNC_SET", {
+    storyId: syncStatus.storyId,
+    enabled: !syncStatus.enabled
+  });
+  if (response?.ok) {
+    syncStatus = response;
+  }
+  button.disabled = false;
+  renderSyncToggle();
 });
 
 document.getElementById("openLibrary")?.addEventListener("click", () => setLibraryOpen(true));
@@ -227,6 +276,7 @@ document.getElementById("libraryList")?.addEventListener("click", (event) => {
 
 render();
 refreshState();
+void refreshSync();
 setInterval(refreshState, 1500);
 // Tick the timer locally between polls; it only advances while the session
 // reports a live playback clock.
