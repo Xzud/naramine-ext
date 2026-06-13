@@ -45,7 +45,7 @@ export function deriveStoryTitle(titles, storyId) {
 
 export function groupLibraryByStory(
   chapters,
-  { warmingChapterIds = [], activeChapterId = null, storyMetadataById = {} } = {}
+  { warmingChapterIds = [], activeChapterId = null, storyMetadataById = {}, lastPlayedByStory = {} } = {}
 ) {
   const warmingSet = new Set(warmingChapterIds);
   const byStory = new Map();
@@ -68,6 +68,15 @@ export function groupLibraryByStory(
       // Metadata scraped from the novel's overview page beats the title
       // heuristic and is the only source for author/cover.
       const metadata = storyMetadataById[storyId] || null;
+      // Where the reader left off in this story, used for the Continue action.
+      // Falls back to the chapter title currently in the library when the
+      // stored record predates a title change.
+      const lastPlayed = lastPlayedByStory[storyId] || null;
+      const lastPlayedTitle = lastPlayed
+        ? sorted.find((chapter) => chapter.chapterId === lastPlayed.chapterId)?.title ||
+          lastPlayed.chapterTitle ||
+          ""
+        : "";
       return {
         storyId,
         title:
@@ -83,7 +92,16 @@ export function groupLibraryByStory(
         chapterCount: sorted.length,
         downloadedCount: sorted.filter((chapter) => chapter.status === "downloaded").length,
         sizeBytes: sorted.reduce((total, chapter) => total + (chapter.sizeBytes || 0), 0),
-        lastUpdatedAt: sorted.reduce((latest, chapter) => Math.max(latest, chapter.createdAt || 0), 0)
+        lastUpdatedAt: sorted.reduce((latest, chapter) => Math.max(latest, chapter.createdAt || 0), 0),
+        lastPlayed: lastPlayed
+          ? {
+              chapterId: lastPlayed.chapterId,
+              chapterTitle: lastPlayedTitle,
+              chunkIndex: lastPlayed.chunkIndex || 0,
+              totalChunks: lastPlayed.totalChunks || 0,
+              updatedAt: lastPlayed.updatedAt || 0
+            }
+          : null
       };
     })
     .sort((left, right) => right.lastUpdatedAt - left.lastUpdatedAt);

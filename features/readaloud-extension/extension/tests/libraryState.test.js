@@ -109,6 +109,55 @@ test("buildLibraryViewModel includes the scraped author in the story summary", (
   assert.equal(view.stories[0].summary, "Author A · 1 of 1 chapter downloaded · 2.0 MB");
 });
 
+test("groupLibraryByStory attaches the last-played position, preferring the live chapter title", () => {
+  const stories = groupLibraryByStory(
+    [buildChapter(), buildChapter({ chapterId: "chapter-2", title: "My Story - Chapter 2", createdAt: 2000 })],
+    {
+      lastPlayedByStory: {
+        "story-1": {
+          chapterId: "chapter-2",
+          chapterTitle: "stale stored title",
+          chunkIndex: 3,
+          totalChunks: 10,
+          updatedAt: 5
+        }
+      }
+    }
+  );
+
+  assert.equal(stories[0].lastPlayed.chapterId, "chapter-2");
+  assert.equal(stories[0].lastPlayed.chapterTitle, "My Story - Chapter 2");
+  assert.equal(stories[0].lastPlayed.chunkIndex, 3);
+});
+
+test("groupLibraryByStory reports no last-played when none is recorded", () => {
+  const stories = groupLibraryByStory([buildChapter()]);
+  assert.equal(stories[0].lastPlayed, null);
+});
+
+test("buildLibraryViewModel builds a Continue label with progress percent", () => {
+  const stories = groupLibraryByStory([buildChapter()], {
+    lastPlayedByStory: {
+      "story-1": {
+        chapterId: "chapter-1",
+        chapterTitle: "My Story - Chapter 1",
+        chunkIndex: 4,
+        totalChunks: 10,
+        updatedAt: 5
+      }
+    }
+  });
+  const view = buildLibraryViewModel({ stories });
+
+  assert.equal(view.stories[0].continue.chapterId, "chapter-1");
+  assert.equal(view.stories[0].continue.label, "My Story - Chapter 1 · 40%");
+});
+
+test("buildLibraryViewModel has no Continue when nothing was played", () => {
+  const stories = groupLibraryByStory([buildChapter()]);
+  assert.equal(buildLibraryViewModel({ stories }).stories[0].continue, null);
+});
+
 test("formatBytes renders human readable sizes", () => {
   assert.equal(formatBytes(0), "0 KB");
   assert.equal(formatBytes(512), "1 KB");

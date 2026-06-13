@@ -1281,6 +1281,241 @@ export class PlaybackQueue {
     return deleteStoryMetadata(storyId);
   }
 
+  // --- "Continue where I left off" -----------------------------------------
+  // A per-story map of the last chapter and position the reader played, so the
+  // library can offer a Continue action that reopens the chapter page and
+  // resumes from there.
+
+  async loadLastPlayed() {
+    const values = await this.storageArea.get(LAST_PLAYED_KEY);
+    return values[LAST_PLAYED_KEY] || {};
+  }
+
+  async saveLastPlayed(map) {
+    await this.storageArea.set({ [LAST_PLAYED_KEY]: map });
+  }
+
+  async getLastPlayed(storyId) {
+    if (!storyId) {
+      return null;
+    }
+    return (await this.loadLastPlayed())[storyId] || null;
+  }
+
+  // Updated as playback advances (each chunk start) so Continue lands on the
+  // furthest point the reader reached. Bounded to the most recent stories.
+  async recordLastPlayed(session, now = Date.now()) {
+    if (!session?.storyId || !session.chapterId) {
+      return;
+    }
+    const map = await this.loadLastPlayed();
+    map[session.storyId] = {
+      storyId: session.storyId,
+      chapterId: session.chapterId,
+      chapterTitle: session.title || "",
+      partUrl: session.sourceUrl || "",
+      chunkIndex: typeof session.currentChunkIndex === "number" ? session.currentChunkIndex : 0,
+      totalChunks: session.totalChunks || 0,
+      updatedAt: now
+    };
+    const trimmed = Object.values(map)
+      .sort((left, right) => (right.updatedAt || 0) - (left.updatedAt || 0))
+      .slice(0, LAST_PLAYED_LIMIT);
+    await this.saveLastPlayed(Object.fromEntries(trimmed.map((record) => [record.storyId, record])));
+  }
+
+  async removeLastPlayed(storyId) {
+    if (!storyId) {
+      return;
+    }
+    const map = await this.loadLastPlayed();
+    if (map[storyId]) {
+      delete map[storyId];
+      await this.saveLastPlayed(map);
+    }
+  }
+
+  // Resumes the story's last-played chapter from where the reader left off.
+  // Reuses an already-open chapter tab when possible; otherwise opens the
+  // chapter's Wattpad page so the resume still registers as an organic visit.
+  async continueStory(payload = {}) {
+    const storyId = payload.storyId || null;
+    const lastPlayed = await this.getLastPlayed(storyId);
+    if (!lastPlayed?.chapterId) {
+      return { ok: false, storyId, error: "no_last_played" };
+    }
+
+    await this.setActiveChapterId(lastPlayed.chapterId);
+
+    const existing = await this.loadSession(lastPlayed.chapterId);
+    if (
+      existing?.text &&
+      existing.state !== "error" &&
+      typeof existing.tabId === "number" &&
+      (await this.prefetchTabExists(existing.tabId))
+    ) {
+      await this.activateResumedChapter({
+        chapterId: lastPlayed.chapterId,
+        tabId: existing.tabId,
+        chunkIndex: lastPlayed.chunkIndex || 0
+      });
+      return { ok: true, storyId, chapterId: lastPlayed.chapterId, resumed: "existing_tab" };
+    }
+
+    if (!lastPlayed.partUrl) {
+      return { ok: false, storyId, error: "missing_chapter_url" };
+    }
+    const opened = await this.openResumeTarget(lastPlayed);
+    return { ok: opened, storyId, chapterId: lastPlayed.chapterId, resumed: "new_tab" };
+  }
+
+  async loadResumeRecord() {
+    const values = await this.storageArea.get(RESUME_TARGET_KEY);
+    return values[RESUME_TARGET_KEY] || null;
+  }
+
+  async saveResumeRecord(record) {
+    await this.storageArea.set({ [RESUME_TARGET_KEY]: record });
+  }
+
+  async clearResumeRecord() {
+    if (typeof this.storageArea.remove === "function") {
+      await this.storageArea.remove(RESUME_TARGET_KEY);
+      return;
+    }
+    await this.storageArea.set({ [RESUME_TARGET_KEY]: null });
+  }
+
+  async openResumeTarget(lastPlayed) {
+    if (!lastPlayed?.partUrl || typeof this.tabsApi?.create !== "function") {
+      return false;
+    }
+
+    return this.runPrefetchExclusive(async () => {
+      const existing = await this.loadResumeRecord();
+      if (
+        existing &&
+        existing.status !== "failed" &&
+        existing.url === lastPlayed.partUrl &&
+        (await this.prefetchTabExists(existing.tabId))
+      ) {
+        return true;
+      }
+
+      const tab = await this.tabsApi.create({ url: lastPlayed.partUrl, active: true });
+      await this.saveResumeRecord({
+        storyId: lastPlayed.storyId || null,
+        chapterId: lastPlayed.chapterId || null,
+        url: lastPlayed.partUrl,
+        chunkIndex: lastPlayed.chunkIndex || 0,
+        tabId: tab?.id ?? null,
+        status: "opening",
+        createdAt: Date.now()
+      });
+      this.log("resume_target_opened", {}, { url: lastPlayed.partUrl, tabId: tab?.id ?? null });
+      return true;
+    });
+  }
+
+  async handleResumeTabUpdated(tabId, changeInfo) {
+    if (changeInfo?.status !== "complete") {
+      return;
+    }
+
+    const claimed = await this.runPrefetchExclusive(async () => {
+      const record = await this.loadResumeRecord();
+      if (!record || record.tabId !== tabId || record.status !== "opening") {
+        return null;
+      }
+      const warming = { ...record, status: "warming" };
+      await this.saveResumeRecord(warming);
+      return warming;
+    });
+
+    if (claimed) {
+      await this.processResumeTab(claimed);
+    }
+  }
+
+  async handleResumeTabRemoved(tabId) {
+    await this.runPrefetchExclusive(async () => {
+      const record = await this.loadResumeRecord();
+      if (record && record.tabId === tabId) {
+        await this.clearResumeRecord();
+      }
+    });
+  }
+
+  async processResumeTab(record) {
+    const extraction = await this.extractFromTabWithRetry(record.tabId);
+    if (!extraction?.ok || !extraction.text) {
+      await this.runPrefetchExclusive(async () => {
+        const latest = await this.loadResumeRecord();
+        if (latest && latest.tabId === record.tabId) {
+          await this.saveResumeRecord({
+            ...latest,
+            status: "failed",
+            error: extraction?.error || "resume_extract_failed"
+          });
+        }
+      });
+      this.log("resume_extract_failed", {}, { tabId: record.tabId, error: extraction?.error || null });
+      return;
+    }
+
+    const chapterId = await this.warmupPrefetchedChapter(record, extraction);
+    if (!chapterId) {
+      return;
+    }
+
+    await this.runPrefetchExclusive(() => this.clearResumeRecord());
+    await this.activateResumedChapter({ chapterId, tabId: record.tabId, chunkIndex: record.chunkIndex || 0 });
+  }
+
+  // Starts the resumed chapter playing from the saved chunk. Goes straight
+  // through processSession (not the popup start path) because the tab is
+  // already focused, so the off-page playback gate does not apply.
+  async activateResumedChapter({ chapterId, tabId = null, chunkIndex = 0 }) {
+    if (!chapterId) {
+      return false;
+    }
+
+    await this.focusSessionTab({ tabId });
+    await this.setActiveChapterId(chapterId);
+
+    return this.runExclusive(async () => {
+      const session = await this.loadSession(chapterId);
+      if (!session?.text || session.state === "error") {
+        return false;
+      }
+      const maxIndex = Math.max(0, (session.totalChunks || 1) - 1);
+      const targetIndex = Math.min(Math.max(0, chunkIndex), maxIndex);
+      const startedSession = {
+        ...session,
+        tabId: typeof tabId === "number" ? tabId : session.tabId || null,
+        paused: false,
+        stopped: false,
+        playRequested: true,
+        currentChunkIndex: targetIndex,
+        currentChunkId: null,
+        playbackAttemptId: null,
+        state: "playback_starting",
+        playbackStatus: "idle",
+        streamStatus: "idle",
+        playBlockedOffPage: false,
+        focusTabOnPlay: false,
+        lastEvent: "resumed_from_last_played",
+        errorMessage: null
+      };
+      await this.saveSession(startedSession);
+      await this.ensureOffscreenDocument();
+      this.interruptWarmupFetches();
+      await this.processSession(chapterId);
+      this.log("resumed_from_last_played", startedSession, { chapterId, chunkIndex: targetIndex });
+      return true;
+    });
+  }
+
   // Drops the live resources owned by a finished chapter: its tab and its
   // persisted session. Cached chunk and audio records stay in IndexedDB so
   // the chapter remains in the downloads library until the user deletes it.
@@ -1313,10 +1548,11 @@ export class PlaybackQueue {
   }
 
   async getLibrary() {
-    const [overview, activeChapterId, storyMetadata] = await Promise.all([
+    const [overview, activeChapterId, storyMetadata, lastPlayedByStory] = await Promise.all([
       this.getLibraryOverviewRecords(),
       this.getActiveChapterId(),
-      this.getStoryMetadataRecords().catch(() => [])
+      this.getStoryMetadataRecords().catch(() => []),
+      this.loadLastPlayed().catch(() => ({}))
     ]);
     return {
       ok: true,
@@ -1324,7 +1560,8 @@ export class PlaybackQueue {
         // Yielded pipelines are still queued work, so they read as processing.
         warmingChapterIds: [...this.activeWarmups.keys(), ...this.pendingWarmups],
         activeChapterId,
-        storyMetadataById: Object.fromEntries((storyMetadata || []).map((record) => [record.storyId, record]))
+        storyMetadataById: Object.fromEntries((storyMetadata || []).map((record) => [record.storyId, record])),
+        lastPlayedByStory
       })
     };
   }
@@ -1365,6 +1602,7 @@ export class PlaybackQueue {
       // (re-charged) user action, not something an open tab should restart.
       await this.saveSyncStories(applySyncToggle(await this.loadSyncStories(), storyId, false));
       await this.deleteStoryMetadataRecord(storyId).catch(() => {});
+      await this.removeLastPlayed(storyId).catch(() => {});
     }
     return this.getLibrary();
   }
@@ -2296,6 +2534,8 @@ export class PlaybackQueue {
         playbackResumedAt: session.playbackResumedAt || Date.now()
       };
       await this.saveSession(startedSession);
+      // Track the furthest point reached so the library can offer Continue.
+      await this.recordLastPlayed(startedSession).catch(() => {});
       await this.focusChunkOnPage(startedSession, message.chunkId, { clearPrevious: true }).catch(() => {});
       await this.prefetchChunkAtOffset(chapterId, startedSession, 1);
       return { refreshSession: startedSession };

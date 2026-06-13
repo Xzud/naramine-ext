@@ -2838,3 +2838,243 @@ test("isViewingChapterPage rejects a story overview or non-Wattpad page", async 
 
   assert.equal(await PlaybackQueue.prototype.isViewingChapterPage.call(queue, "222"), false);
 });
+
+test("recordLastPlayed stores per-story position and bounds the history", async () => {
+  const queue = new TestPlaybackQueue();
+  for (let index = 0; index < 32; index += 1) {
+    await queue.recordLastPlayed(
+      {
+        storyId: `story-${index}`,
+        chapterId: `chapter-${index}`,
+        title: `Chapter ${index}`,
+        sourceUrl: `https://www.wattpad.com/chapter-${index}`,
+        currentChunkIndex: index,
+        totalChunks: 40
+      },
+      index + 1
+    );
+  }
+
+  const recent = await queue.getLastPlayed("story-31");
+  assert.equal(recent.chapterId, "chapter-31");
+  assert.equal(recent.chunkIndex, 31);
+  assert.equal(recent.partUrl, "https://www.wattpad.com/chapter-31");
+
+  const map = (await queue.storageArea.get("readaloud:lastPlayedByStory"))["readaloud:lastPlayedByStory"];
+  assert.equal(Object.keys(map).length, 30);
+  // The two oldest stories were trimmed away.
+  assert.equal(map["story-0"], undefined);
+  assert.equal(map["story-1"], undefined);
+});
+
+test("chunk playback start records the story's last-played position", async () => {
+  const queue = new TestPlaybackQueue();
+
+  await queue.saveSession({
+    chapterId: "chapter-lp",
+    storyId: "story-lp",
+    title: "Last Played Chapter",
+    partId: "chapter-lp",
+    sourceUrl: "https://www.wattpad.com/chapter-lp",
+    extractionStrategy: "dom-paragraphs",
+    extractionConfidence: "high",
+    state: "awaiting_chunk_end",
+    stopped: false,
+    paused: false,
+    playRequested: true,
+    playbackStatus: "playing",
+    currentChunkIndex: 0,
+    currentChunkId: "chunk-lp-0",
+    totalChunks: 3,
+    startupReadyAudioCount: 0,
+    startupTargetReadyAudioCount: 0,
+    startupBufferingComplete: false,
+    hasStartedPlayback: true,
+    playbackAttemptId: "chapter-lp:attempt:1",
+    nextPlaybackAttemptSequence: 1,
+    lastEvent: "playback_started",
+    errorMessage: null,
+    retryCount: 0,
+    lastRetryReason: null,
+    lastRetryKind: null,
+    lastCompletedChunkId: null,
+    text: "Last played text",
+    transportMode: "live_stream",
+    streamStatus: "playing",
+    bytesReceived: 800,
+    bufferedAudioMs: 200,
+    firstByteAt: 1,
+    firstAudioAt: 2,
+    stallCount: 0
+  });
+
+  await queue.handleRuntimeMessage({
+    type: "CHUNK_PLAYBACK_STARTED",
+    chapterId: "chapter-lp",
+    chunkId: "chunk-lp-0",
+    attemptId: "chapter-lp:attempt:1"
+  });
+
+  const record = await queue.getLastPlayed("story-lp");
+  assert.equal(record.chapterId, "chapter-lp");
+  assert.equal(record.chunkIndex, 0);
+  assert.equal(record.partUrl, "https://www.wattpad.com/chapter-lp");
+});
+
+test("library exposes the last-played chapter for the Continue action", async () => {
+  const queue = new TestPlaybackQueue();
+  queue.getStoryMetadataRecords = async () => [];
+  queue.getLibraryOverviewRecords = async () => [
+    {
+      chapterId: "ch-1",
+      storyId: "story-x",
+      title: "Tale - Chapter 1",
+      createdAt: 1,
+      chunkCount: 4,
+      readyAudioCount: 4,
+      failedCount: 0,
+      sizeBytes: 2048
+    },
+    {
+      chapterId: "ch-2",
+      storyId: "story-x",
+      title: "Tale - Chapter 2",
+      createdAt: 2,
+      chunkCount: 4,
+      readyAudioCount: 2,
+      failedCount: 0,
+      sizeBytes: 1024
+    }
+  ];
+  await queue.storageArea.set({
+    "readaloud:lastPlayedByStory": {
+      "story-x": {
+        storyId: "story-x",
+        chapterId: "ch-2",
+        chapterTitle: "Tale - Chapter 2",
+        partUrl: "https://www.wattpad.com/ch-2",
+        chunkIndex: 1,
+        totalChunks: 4,
+        updatedAt: 9
+      }
+    }
+  });
+
+  const library = await queue.getLibrary();
+
+  assert.equal(library.stories[0].lastPlayed.chapterId, "ch-2");
+  assert.equal(library.stories[0].lastPlayed.chapterTitle, "Tale - Chapter 2");
+  assert.equal(library.stories[0].lastPlayed.chunkIndex, 1);
+});
+
+test("continue resumes an already-open chapter tab from the saved position", async () => {
+  const queue = new TestPlaybackQueue();
+  await queue.storageArea.set({
+    "readaloud:lastPlayedByStory": {
+      "story-resume": {
+        storyId: "story-resume",
+        chapterId: "ch-resume",
+        chapterTitle: "Chapter 5",
+        partUrl: "https://www.wattpad.com/ch-resume",
+        chunkIndex: 2,
+        totalChunks: 5,
+        updatedAt: 10
+      }
+    }
+  });
+  await queue.saveSession(
+    buildWarmSession("ch-resume", { storyId: "story-resume", tabId: 71, totalChunks: 5 })
+  );
+  queue.tabRegistry.add(71);
+
+  const response = await queue.continueStory({ storyId: "story-resume" });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.resumed, "existing_tab");
+  assert.equal(await queue.getActiveChapterId(), "ch-resume");
+  assert.deepEqual(queue.startedStreams, ["ch-resume"]);
+  assert.equal(queue.createdTabs.length, 0);
+  assert.ok(queue.updatedTabs.some((update) => update.tabId === 71 && update.active === true));
+
+  const session = await queue.loadSession("ch-resume");
+  assert.equal(session.currentChunkIndex, 2);
+  assert.equal(session.playRequested, true);
+});
+
+test("continue opens the chapter page and resumes from the saved position", async () => {
+  const extraction = {
+    ok: true,
+    text: "Resume chapter text",
+    title: "Chapter 9",
+    sourceUrl: "https://www.wattpad.com/909-ch9",
+    storyId: "story-open",
+    partId: "909",
+    strategy: "dom-paragraphs",
+    confidence: "high"
+  };
+  const queue = new TestPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_EXTRACT_TEXT") {
+        return extraction;
+      }
+      return { ok: true };
+    }
+  });
+  queue.getChapterRecord = async () => null;
+  await queue.storageArea.set({
+    "readaloud:lastPlayedByStory": {
+      "story-open": {
+        storyId: "story-open",
+        chapterId: "909",
+        chapterTitle: "Chapter 9",
+        partUrl: "https://www.wattpad.com/909-ch9",
+        chunkIndex: 1,
+        totalChunks: 3,
+        updatedAt: 5
+      }
+    }
+  });
+
+  const response = await queue.continueStory({ storyId: "story-open" });
+
+  assert.equal(response.ok, true);
+  assert.equal(response.resumed, "new_tab");
+  assert.equal(queue.createdTabs.length, 1);
+  assert.equal(queue.createdTabs[0].url, "https://www.wattpad.com/909-ch9");
+  assert.equal(queue.createdTabs[0].active, true);
+
+  await queue.handleResumeTabUpdated(queue.createdTabs[0].id, { status: "complete" });
+  await flushAsyncWork();
+
+  assert.equal(await queue.getActiveChapterId(), "909");
+  assert.deepEqual(queue.startedStreams, ["909"]);
+  assert.equal(await queue.loadResumeRecord(), null);
+
+  const session = await queue.loadSession("909");
+  assert.equal(session.currentChunkIndex, 1);
+  assert.equal(session.playRequested, true);
+});
+
+test("continue reports when the story has no last-played record", async () => {
+  const queue = new TestPlaybackQueue();
+  const response = await queue.continueStory({ storyId: "story-none" });
+  assert.equal(response.ok, false);
+  assert.equal(response.error, "no_last_played");
+  assert.equal(queue.createdTabs.length, 0);
+});
+
+test("deleting a story clears its last-played record", async () => {
+  const queue = new TestPlaybackQueue();
+  queue.getChapterIdsForStory = async () => [];
+  queue.getLibraryOverviewRecords = async () => [];
+  queue.getStoryMetadataRecords = async () => [];
+  await queue.storageArea.set({
+    "readaloud:lastPlayedByStory": {
+      "story-del": { storyId: "story-del", chapterId: "c", chunkIndex: 0, totalChunks: 1, updatedAt: 1 }
+    }
+  });
+
+  await queue.deleteDownloadedStory("story-del");
+
+  assert.equal(await queue.getLastPlayed("story-del"), null);
+});

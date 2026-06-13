@@ -82,6 +82,15 @@ function buildChapterMeta(chapter) {
   return `${Math.min(99, percent)}% downloaded · ${size}`;
 }
 
+function buildContinueLabel(lastPlayed) {
+  const title = lastPlayed.chapterTitle || "your last chapter";
+  if (lastPlayed.totalChunks > 0) {
+    const percent = Math.min(99, Math.floor((lastPlayed.chunkIndex / lastPlayed.totalChunks) * 100));
+    return `${title} · ${percent}%`;
+  }
+  return title;
+}
+
 export function buildLibraryViewModel(library) {
   const stories = Array.isArray(library?.stories) ? library.stories : [];
   return {
@@ -91,6 +100,12 @@ export function buildLibraryViewModel(library) {
       title: story.title || "Unknown story",
       author: story.author || "",
       coverUrl: story.coverUrl || "",
+      continue: story.lastPlayed
+        ? {
+            chapterId: story.lastPlayed.chapterId,
+            label: buildContinueLabel(story.lastPlayed)
+          }
+        : null,
       summary: [
         story.author || null,
         `${story.downloadedCount} of ${story.chapterCount} chapter${story.chapterCount === 1 ? "" : "s"} downloaded · ${formatBytes(story.sizeBytes)}`

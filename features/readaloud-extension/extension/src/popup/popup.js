@@ -120,10 +120,32 @@ function renderStory(story, openStoryIds) {
   summary.append(heading, createDeleteButton(`Delete all audio for ${story.title}`, { storyId: story.storyId }));
   group.append(summary);
 
+  if (story.continue) {
+    group.append(createContinueButton(story));
+  }
+
   for (const chapter of story.chapters) {
     group.append(renderChapter(chapter));
   }
   return group;
+}
+
+const CONTINUE_ICON =
+  '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6.82v10.36c0 .79.87 1.27 1.54.84l8.14-5.18a1 1 0 0 0 0-1.68L9.54 5.98A1 1 0 0 0 8 6.82Z" /></svg>';
+
+function createContinueButton(story) {
+  const button = document.createElement("button");
+  button.className = "continue-button";
+  button.dataset.continueStoryId = story.storyId;
+  button.title = `Continue ${story.continue.label}`;
+
+  const label = document.createElement("span");
+  label.className = "continue-label";
+  label.textContent = `Continue · ${story.continue.label}`;
+
+  button.innerHTML = CONTINUE_ICON;
+  button.append(label);
+  return button;
 }
 
 function getOpenStoryIds(listElement) {
@@ -263,7 +285,27 @@ document.getElementById("syncToggle")?.addEventListener("click", async () => {
 document.getElementById("openLibrary")?.addEventListener("click", () => setLibraryOpen(true));
 document.getElementById("closeLibrary")?.addEventListener("click", () => setLibraryOpen(false));
 
+async function handleContinueClick(button) {
+  button.disabled = true;
+  const response = await request("LIBRARY_CONTINUE", { storyId: button.dataset.continueStoryId });
+  if (response?.ok) {
+    // Drop back to the player so the resumed chapter's progress is visible.
+    setLibraryOpen(false);
+    await refreshState();
+    return;
+  }
+  button.disabled = false;
+}
+
 document.getElementById("libraryList")?.addEventListener("click", (event) => {
+  const continueButton = event.target.closest?.(".continue-button");
+  if (continueButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    void handleContinueClick(continueButton);
+    return;
+  }
+
   const button = event.target.closest?.(".delete-button");
   if (!button) {
     return;
