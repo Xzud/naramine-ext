@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { PlaybackQueue } from "../src/audio/playbackQueue.js";
+import { USER_SETTINGS_KEY } from "../src/shared/userSettings.js";
 import { chunkText, stableHash } from "../src/text/chunkText.js";
 
 class MemoryStorageArea {
@@ -380,6 +381,50 @@ test("warmup prepares chapter metadata without starting playback", async () => {
   assert.equal(state.state, "startup_ready");
   assert.equal(state.warmupStatus, "warm_ready");
   assert.equal(queue.startedStreams.length, 0);
+});
+
+test("warmup uses the saved default voice when none is supplied", async () => {
+  const queue = new TestPlaybackQueue({
+    storageArea: new MemoryStorageArea({
+      [USER_SETTINGS_KEY]: {
+        defaultVoice: "bm_lewis"
+      }
+    })
+  });
+
+  await queue.warmup({
+    ok: true,
+    text: "Warm chapter text",
+    title: "Warm Chapter",
+    sourceUrl: "https://www.wattpad.com/123",
+    storyId: "story-warmup",
+    partId: "chapter-warmup",
+    strategy: "dom-paragraphs",
+    confidence: "high"
+  });
+
+  const session = await queue.loadSession("chapter-warmup");
+  assert.equal(session.voice, "bm_lewis");
+});
+
+test("explicit voice input overrides the saved default voice", async () => {
+  const queue = new TestPlaybackQueue({
+    storageArea: new MemoryStorageArea({
+      [USER_SETTINGS_KEY]: {
+        defaultVoice: "bm_lewis"
+      }
+    })
+  });
+
+  const input = await queue.resolvePlaybackInput({
+    ok: true,
+    text: "Explicit voice text",
+    storyId: "story-warmup",
+    partId: "chapter-warmup",
+    voice: "af_heart"
+  });
+
+  assert.equal(input.voice, "af_heart");
 });
 
 test("play on a warmed session starts the live stream path", async () => {

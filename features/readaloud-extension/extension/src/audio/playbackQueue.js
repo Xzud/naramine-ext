@@ -8,6 +8,7 @@ import {
 } from "../shared/constants.js";
 import { groupLibraryByStory } from "../shared/libraryState.js";
 import { applySyncToggle, isStorySyncEnabled, planSyncStart } from "../shared/syncState.js";
+import { loadUserSettings } from "../shared/userSettings.js";
 import { chunkText, stableHash } from "../text/chunkText.js";
 import {
   cleanupExpiredAudio,
@@ -218,6 +219,10 @@ export class PlaybackQueue {
     await this.storageArea.set({
       [ACTIVE_CHAPTER_KEY]: chapterId
     });
+  }
+
+  async getDefaultVoice() {
+    return (await loadUserSettings(this.storageArea)).defaultVoice;
   }
 
   async resolveChapterId(chapterId) {
@@ -3132,11 +3137,13 @@ export class PlaybackQueue {
         };
       }
 
+      const voice = options.voice || (await this.getDefaultVoice());
+
       return {
         ok: true,
         chapterId: options.partId || options.chapterId || DEFAULT_CHAPTER_ID,
         storyId: options.storyId || DEFAULT_STORY_ID,
-        voice: options.voice || DEFAULT_VOICE,
+        voice,
         providerMode: options.providerMode || DEFAULT_PROVIDER_MODE,
         text: options.text,
         paragraphs: options.paragraphs || [],
@@ -3154,11 +3161,12 @@ export class PlaybackQueue {
     }
 
     if (options.text) {
+      const voice = options.voice || (await this.getDefaultVoice());
       return {
         ok: true,
         chapterId: options.chapterId || DEFAULT_CHAPTER_ID,
         storyId: options.storyId || DEFAULT_STORY_ID,
-        voice: options.voice || DEFAULT_VOICE,
+        voice,
         providerMode: options.providerMode || DEFAULT_PROVIDER_MODE,
         text: options.text,
         paragraphs: [],
@@ -3242,11 +3250,12 @@ export class PlaybackQueue {
     }
 
     const chapterId = extraction.partId || options.chapterId || DEFAULT_CHAPTER_ID;
+    const voice = options.voice || (await this.getDefaultVoice());
     return {
       ok: true,
       chapterId,
       storyId: extraction.storyId || options.storyId || DEFAULT_STORY_ID,
-      voice: options.voice || DEFAULT_VOICE,
+      voice,
       providerMode: options.providerMode || DEFAULT_PROVIDER_MODE,
       text: extraction.text,
       paragraphs: extraction.paragraphs || [],
@@ -3262,10 +3271,11 @@ export class PlaybackQueue {
 
   async saveExtractionError(input) {
     const chapterId = input.chapterId || DEFAULT_CHAPTER_ID;
+    const defaultVoice = await this.getDefaultVoice();
     const session = {
       chapterId,
       storyId: input.storyId || DEFAULT_STORY_ID,
-      voice: DEFAULT_VOICE,
+      voice: defaultVoice,
       providerMode: DEFAULT_PROVIDER_MODE,
       tabId: input.tabId || null,
       text: "",

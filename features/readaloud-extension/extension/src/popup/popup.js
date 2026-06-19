@@ -41,6 +41,23 @@ async function request(type, payload = {}) {
   }
 }
 
+function openSettingsPage() {
+  if (chrome.runtime?.openOptionsPage) {
+    void chrome.runtime.openOptionsPage();
+    return;
+  }
+
+  const fallbackUrl = chrome.runtime?.getURL?.("src/options/options.html");
+  if (!fallbackUrl) {
+    return;
+  }
+  if (chrome.tabs?.create) {
+    void chrome.tabs.create({ url: fallbackUrl });
+  } else {
+    window.open(fallbackUrl, "_blank");
+  }
+}
+
 function render() {
   const view = buildPopupViewModel(lastState, Date.now());
 
@@ -451,6 +468,9 @@ document.addEventListener("click", (event) => {
 document.getElementById("openLibrary")?.addEventListener("click", () => setLibraryOpen(true));
 document.getElementById("closeLibrary")?.addEventListener("click", () => setLibraryOpen(false));
 document.getElementById("guideLibrary")?.addEventListener("click", () => setLibraryOpen(true));
+for (const button of document.querySelectorAll("[data-open-settings]")) {
+  button.addEventListener("click", openSettingsPage);
+}
 
 document.getElementById("browseWattpad")?.addEventListener("click", () => {
   if (chrome.tabs?.create) {
