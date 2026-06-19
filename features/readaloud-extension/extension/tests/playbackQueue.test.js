@@ -32,6 +32,7 @@ class TestPlaybackQueue extends PlaybackQueue {
       error: null,
       streamStatus: "idle",
       bytesReceived: 0,
+      playedAudioMs: 0,
       bufferedSegmentCount: 0,
       slots: []
     };
@@ -181,6 +182,21 @@ class TestPlaybackQueue extends PlaybackQueue {
   async processSession(chapterId) {
     this.processCalls += 1;
     return PlaybackQueue.prototype.processSession.call(this, chapterId);
+  }
+}
+
+class DispatchingPlaybackQueue extends TestPlaybackQueue {
+  async ensureWarmingPipeline() {
+    return "disabled-for-dispatch-tests";
+  }
+
+  async ensureNextChapterPrefetch() {
+    return false;
+  }
+
+  async startCurrentChunkStream(chapterId) {
+    this.startedStreams.push(chapterId);
+    return PlaybackQueue.prototype.startCurrentChunkStream.call(this, chapterId);
   }
 }
 
@@ -1576,6 +1592,7 @@ function buildPlayingSession(chapterId, overrides = {}) {
     playbackStatus: "playing",
     currentChunkIndex: 0,
     currentChunkId: `${chapterId}:0:h1`,
+    currentChunkOffsetMs: 0,
     totalChunks: 3,
     startupReadyAudioCount: 0,
     startupTargetReadyAudioCount: 0,
@@ -1597,6 +1614,8 @@ function buildPlayingSession(chapterId, overrides = {}) {
     firstByteAt: 1,
     firstAudioAt: 2,
     stallCount: 0,
+    playbackElapsedMs: 0,
+    playbackResumedAt: 1000,
     ...overrides
   };
 }
@@ -2773,6 +2792,7 @@ function buildWarmSession(chapterId, overrides = {}) {
     playbackStatus: "idle",
     currentChunkIndex: 0,
     currentChunkId: null,
+    currentChunkOffsetMs: 0,
     totalChunks: 3,
     startupReadyAudioCount: 0,
     startupTargetReadyAudioCount: 0,
@@ -2794,6 +2814,8 @@ function buildWarmSession(chapterId, overrides = {}) {
     firstByteAt: null,
     firstAudioAt: null,
     stallCount: 0,
+    playbackElapsedMs: 0,
+    playbackResumedAt: null,
     ...overrides
   };
 }
@@ -3033,7 +3055,7 @@ test("library exposes the last-played chapter for the Continue action", async ()
 });
 
 test("continue resumes an already-open chapter tab from the saved position", async () => {
-  const queue = new TestPlaybackQueue();
+  const queue = new DispatchingPlaybackQueue();
   await queue.storageArea.set({
     "readaloud:lastPlayedByStory": {
       "story-resume": {
@@ -3042,6 +3064,8 @@ test("continue resumes an already-open chapter tab from the saved position", asy
         chapterTitle: "Chapter 5",
         partUrl: "https://www.wattpad.com/ch-resume",
         chunkIndex: 2,
+        chunkOffsetMs: 2400,
+        chapterOffsetMs: 18400,
         totalChunks: 5,
         updatedAt: 10
       }
@@ -3060,10 +3084,184 @@ test("continue resumes an already-open chapter tab from the saved position", asy
   assert.deepEqual(queue.startedStreams, ["ch-resume"]);
   assert.equal(queue.createdTabs.length, 0);
   assert.ok(queue.updatedTabs.some((update) => update.tabId === 71 && update.active === true));
+  const dispatch = queue.sentMessages.find((message) => message.type === "START_STREAM_PLAYBACK");
+  assert.equal(dispatch.startOffsetMs, 2400);
 
   const session = await queue.loadSession("ch-resume");
   assert.equal(session.currentChunkIndex, 2);
+  assert.equal(session.currentChunkOffsetMs, 2400);
   assert.equal(session.playRequested, true);
+});
+
+test("story-page play reopens the story cursor chapter instead of defaulting to chapter one", async () => {
+  const queue = new DispatchingPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_GET_PAGE_CONTEXT") {
+        return {
+          kind: "story",
+          ok: true,
+          storyId: "story-story",
+          title: "Cursor Story",
+          firstPart: { partId: "111", url: "https://www.wattpad.com/111-story-ch1", title: "Chapter 1" }
+        };
+      }
+      return { ok: true };
+    }
+  });
+  await queue.storageArea.set({
+    "readaloud:lastPlayedByStory": {
+      "story-story": {
+        storyId: "story-story",
+        chapterId: "ch-current",
+        chapterTitle: "Chapter 7",
+        partUrl: "https://www.wattpad.com/ch-current",
+        chunkIndex: 2,
+        chunkOffsetMs: 2600,
+        chapterOffsetMs: 29600,
+        totalChunks: 8,
+        updatedAt: 10
+      }
+    }
+  });
+  await queue.saveSession(
+    buildWarmSession("ch-current", { storyId: "story-story", tabId: 61, totalChunks: 8 })
+  );
+  queue.tabRegistry.add(61);
+
+  const state = await queue.start();
+
+  assert.equal(state.chapterId, "ch-current");
+  assert.equal(await queue.getActiveChapterId(), "ch-current");
+  assert.deepEqual(queue.startedStreams, ["ch-current"]);
+  const dispatch = queue.sentMessages.find((message) => message.type === "START_STREAM_PLAYBACK");
+  assert.equal(dispatch.startOffsetMs, 2600);
+});
+
+test("chapter-page play resumes from the story cursor when the page matches the current chapter", async () => {
+  const queue = new DispatchingPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_GET_PAGE_CONTEXT") {
+        return {
+          kind: "chapter",
+          ok: true,
+          storyId: "story-cursor",
+          partId: "ch-cursor",
+          title: "Chapter 4"
+        };
+      }
+      return { ok: true };
+    }
+  });
+  await queue.storageArea.set({
+    "readaloud:lastPlayedByStory": {
+      "story-cursor": {
+        storyId: "story-cursor",
+        chapterId: "ch-cursor",
+        chapterTitle: "Chapter 4",
+        partUrl: "https://www.wattpad.com/ch-cursor",
+        chunkIndex: 2,
+        chunkOffsetMs: 9100,
+        chapterOffsetMs: 42100,
+        totalChunks: 6,
+        updatedAt: 9
+      }
+    }
+  });
+  await queue.saveSession(
+    buildWarmSession("ch-cursor", { storyId: "story-cursor", tabId: 72, totalChunks: 6 })
+  );
+
+  await queue.start();
+
+  const session = await queue.loadSession("ch-cursor");
+  assert.equal(session.currentChunkIndex, 2);
+  assert.equal(session.currentChunkOffsetMs, 9100);
+  assert.equal(session.playbackElapsedMs, 42100);
+  const dispatch = queue.sentMessages.find((message) => message.type === "START_STREAM_PLAYBACK");
+  assert.equal(dispatch.startOffsetMs, 9100);
+});
+
+test("chapter-page play restarts from the beginning when the reader opened a different chapter", async () => {
+  const queue = new DispatchingPlaybackQueue({
+    onTabMessage(_tabId, message) {
+      if (message.type === "READALOUD_GET_PAGE_CONTEXT") {
+        return {
+          kind: "chapter",
+          ok: true,
+          storyId: "story-switch",
+          partId: "ch-new",
+          title: "Chapter 9"
+        };
+      }
+      return { ok: true };
+    }
+  });
+  await queue.storageArea.set({
+    "readaloud:lastPlayedByStory": {
+      "story-switch": {
+        storyId: "story-switch",
+        chapterId: "ch-old",
+        chapterTitle: "Chapter 3",
+        partUrl: "https://www.wattpad.com/ch-old",
+        chunkIndex: 4,
+        chunkOffsetMs: 5800,
+        chapterOffsetMs: 38800,
+        totalChunks: 7,
+        updatedAt: 8
+      }
+    }
+  });
+  await queue.saveSession(
+    buildWarmSession("ch-new", {
+      storyId: "story-switch",
+      tabId: 73,
+      totalChunks: 7,
+      currentChunkIndex: 3,
+      currentChunkOffsetMs: 6400
+    })
+  );
+
+  await queue.start();
+
+  const session = await queue.loadSession("ch-new");
+  assert.equal(session.currentChunkIndex, 0);
+  assert.equal(session.currentChunkOffsetMs, 0);
+  assert.equal(session.playbackElapsedMs, 0);
+  const dispatch = queue.sentMessages.find((message) => message.type === "START_STREAM_PLAYBACK");
+  assert.equal(dispatch.startOffsetMs, 0);
+});
+
+test("pause persists the current in-chunk cursor for later resume", async () => {
+  const queue = new TestPlaybackQueue({
+    runtimeStatus: {
+      playing: true,
+      paused: false,
+      chunkId: "chapter-pause:0:h1",
+      ended: false,
+      error: null,
+      streamStatus: "playing",
+      bytesReceived: 1024,
+      bufferedSegmentCount: 0,
+      bufferedAudioMs: 400,
+      playedAudioMs: 8450,
+      slots: []
+    }
+  });
+  await queue.setActiveChapterId("chapter-pause");
+  await queue.saveSession(
+    buildPlayingSession("chapter-pause", {
+      storyId: "story-pause",
+      sourceUrl: "https://www.wattpad.com/chapter-pause",
+      playbackElapsedMs: 30000,
+      playbackResumedAt: Date.now() - 2000
+    })
+  );
+
+  await queue.pause("chapter-pause");
+
+  const record = await queue.getLastPlayed("story-pause");
+  assert.equal(record.chunkOffsetMs, 8450);
+  assert.ok(record.chapterOffsetMs >= 32000);
 });
 
 test("continue opens the chapter page and resumes from the saved position", async () => {
@@ -3094,6 +3292,8 @@ test("continue opens the chapter page and resumes from the saved position", asyn
         chapterTitle: "Chapter 9",
         partUrl: "https://www.wattpad.com/909-ch9",
         chunkIndex: 1,
+        chunkOffsetMs: 1800,
+        chapterOffsetMs: 12100,
         totalChunks: 3,
         updatedAt: 5
       }
@@ -3117,6 +3317,7 @@ test("continue opens the chapter page and resumes from the saved position", asyn
 
   const session = await queue.loadSession("909");
   assert.equal(session.currentChunkIndex, 1);
+  assert.equal(session.currentChunkOffsetMs, 1800);
   assert.equal(session.playRequested, true);
 });
 

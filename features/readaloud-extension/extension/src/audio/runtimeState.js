@@ -78,6 +78,7 @@ export function createRuntimeState(overrides = {}) {
     playbackStatus: "idle",
     currentChunkIndex: null,
     currentChunkId: null,
+    currentChunkOffsetMs: 0,
     totalChunks: 0,
     pageDetected: false,
     pageEligible: false,
@@ -169,6 +170,7 @@ export function mapSessionToRuntimeState(session, cache = {}, overrides = {}) {
     currentChunkIndex:
       typeof session.currentChunkIndex === "number" ? session.currentChunkIndex : null,
     currentChunkId: session.currentChunkId || null,
+    currentChunkOffsetMs: Math.max(0, Math.round(session.currentChunkOffsetMs || 0)),
     totalChunks: session.totalChunks || 0,
     pageDetected: Boolean(session.pageDetected),
     pageEligible: Boolean(session.pageEligible),

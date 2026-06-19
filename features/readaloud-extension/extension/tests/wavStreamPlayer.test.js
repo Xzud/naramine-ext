@@ -252,3 +252,28 @@ test("WavStreamPlayer starts and finishes streams shorter than the start buffer"
   }
   assert.equal(events.includes("ended"), true);
 });
+
+test("WavStreamPlayer can resume from a mid-chunk offset", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalAudioContext = globalThis.AudioContext;
+  globalThis.AudioContext = FakeAudioContext;
+
+  const player = new WavStreamPlayer({}, { startOffsetMs: 125 });
+  t.after(async () => {
+    await player.stop();
+    globalThis.fetch = originalFetch;
+    globalThis.AudioContext = originalAudioContext;
+  });
+
+  const wavBytes = buildWavBytes({ frames: 6000 });
+  stubFetchWithChunks([wavBytes]);
+
+  await player.open({ url: "http://localhost/tts", method: "POST", body: "{}" });
+  await player.readerPromise;
+
+  const context = player.audioContext;
+  assert.ok(context instanceof FakeAudioContext);
+  const lastSource = context.createdSources[context.createdSources.length - 1];
+  assert.equal(lastSource.buffer.length, 3000);
+  assert.equal(player.getStatus().playedAudioMs, 125);
+});

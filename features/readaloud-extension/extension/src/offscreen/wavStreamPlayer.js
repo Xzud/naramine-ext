@@ -145,6 +145,33 @@ class ByteQueue {
 
     return result;
   }
+
+  skipAligned(maxBytes, alignment) {
+    if (this.length < alignment) {
+      return 0;
+    }
+
+    const targetLength = Math.min(this.length - (this.length % alignment), maxBytes - (maxBytes % alignment));
+    if (targetLength <= 0) {
+      return 0;
+    }
+
+    let skipped = 0;
+    while (skipped < targetLength && this.chunks.length > 0) {
+      const chunk = this.chunks[0];
+      const available = chunk.length - this.offset;
+      const take = Math.min(available, targetLength - skipped);
+      skipped += take;
+      this.offset += take;
+      this.length -= take;
+      if (this.offset >= chunk.length) {
+        this.chunks.shift();
+        this.offset = 0;
+      }
+    }
+
+    return skipped;
+  }
 }
 
 export class WavStreamPlayer {
@@ -152,6 +179,7 @@ export class WavStreamPlayer {
     this.callbacks = callbacks;
     this.autoStart = options.autoStart ?? true;
     this.startBufferMs = options.startBufferMs ?? DEFAULT_START_BUFFER_MS;
+    this.startOffsetMs = Math.max(0, Math.round(options.startOffsetMs || 0));
     this.audioContext = null;
     this.gainNode = null;
     this.scheduledSources = new Set();
@@ -175,6 +203,10 @@ export class WavStreamPlayer {
     this.closed = false;
     this.finished = false;
     this.progressTimer = null;
+    this.skipBytesRemaining = 0;
+    this.playbackTimelineStartTime = null;
+    this.pauseContextTime = null;
+    this.pausedAtPlayedAudioMs = null;
   }
 
   async open(request) {
@@ -214,6 +246,8 @@ export class WavStreamPlayer {
     if (this.closed) {
       return;
     }
+    this.pausedAtPlayedAudioMs = this.getPlayedAudioMs();
+    this.pauseContextTime = this.audioContext?.currentTime ?? null;
     this.paused = true;
     this.streamStatus = "paused";
     if (this.audioContext && this.playbackStarted) {
@@ -231,6 +265,11 @@ export class WavStreamPlayer {
       await this.audioContext.resume().catch(() => {});
     }
     if (this.playbackStarted) {
+      if (this.audioContext && this.pauseContextTime !== null && this.playbackTimelineStartTime !== null) {
+        this.playbackTimelineStartTime += Math.max(0, this.audioContext.currentTime - this.pauseContextTime);
+      }
+      this.pauseContextTime = null;
+      this.pausedAtPlayedAudioMs = null;
       this.streamStatus = "playing";
     } else {
       this.streamStatus = "receiving";
@@ -280,6 +319,10 @@ export class WavStreamPlayer {
     this.pcmQueue.clear();
     this.headerChunks = [];
     this.headerLength = 0;
+    this.skipBytesRemaining = 0;
+    this.playbackTimelineStartTime = null;
+    this.pauseContextTime = null;
+    this.pausedAtPlayedAudioMs = null;
   }
 
   getStatus() {
@@ -291,7 +334,8 @@ export class WavStreamPlayer {
       firstAudioAt: this.firstAudioAt,
       playbackStarted: this.playbackStarted,
       paused: this.paused,
-      ready: this.readyNotified || this.getBufferedAudioMs() >= this.startBufferMs
+      ready: this.readyNotified || this.getBufferedAudioMs() >= this.startBufferMs,
+      playedAudioMs: this.getPlayedAudioMs()
     };
   }
 
@@ -347,18 +391,31 @@ export class WavStreamPlayer {
       }
 
       this.header = parsedHeader;
+      this.skipBytesRemaining = Math.ceil(
+        (this.header.sampleRate * this.header.bytesPerFrame * this.startOffsetMs) / 1000
+      );
       const dataBytes = headerBytes.subarray(parsedHeader.dataOffset);
       this.headerChunks = [];
       this.headerLength = 0;
       if (dataBytes.length > 0) {
         this.pcmQueue.append(dataBytes);
       }
+      this.trimLeadingOffset();
       this.maybeNotifyReady();
       return;
     }
 
     this.pcmQueue.append(chunk);
+    this.trimLeadingOffset();
     this.maybeNotifyReady();
+  }
+
+  trimLeadingOffset() {
+    if (!this.header?.bytesPerFrame || this.skipBytesRemaining <= 0) {
+      return;
+    }
+    const skipped = this.pcmQueue.skipAligned(this.skipBytesRemaining, this.header.bytesPerFrame);
+    this.skipBytesRemaining = Math.max(0, this.skipBytesRemaining - skipped);
   }
 
   maybeStartPlayback() {
@@ -383,6 +440,7 @@ export class WavStreamPlayer {
     this.streamStatus = "playing";
     this.firstAudioAt = Date.now();
     this.scheduledUntil = this.audioContext.currentTime + SCHEDULE_EPSILON_S;
+    this.playbackTimelineStartTime = this.scheduledUntil;
     this.schedulePendingAudio();
     this.startProgressTimer();
     this.callbacks.onStarted?.(this.getStatus());
@@ -541,6 +599,24 @@ export class WavStreamPlayer {
       bufferedMs += Math.max(0, (this.scheduledUntil - this.audioContext.currentTime) * 1000);
     }
     return Math.round(bufferedMs);
+  }
+
+  getPlayedAudioMs() {
+    if (!this.playbackStarted || this.playbackTimelineStartTime === null) {
+      return this.startOffsetMs;
+    }
+
+    if (this.paused && this.pausedAtPlayedAudioMs !== null) {
+      return this.pausedAtPlayedAudioMs;
+    }
+
+    if (!this.audioContext) {
+      return this.startOffsetMs;
+    }
+
+    const renderedUntil = Math.min(this.audioContext.currentTime, this.scheduledUntil);
+    const playedMs = Math.max(0, Math.round((renderedUntil - this.playbackTimelineStartTime) * 1000));
+    return this.startOffsetMs + playedMs;
   }
 
   emitProgress(force = false) {

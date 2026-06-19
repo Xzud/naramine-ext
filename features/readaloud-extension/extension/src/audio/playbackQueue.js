@@ -164,6 +164,13 @@ export class PlaybackQueue {
     };
   }
 
+  getSessionChapterOffsetMs(session, now = Date.now()) {
+    if (!session) {
+      return 0;
+    }
+    return (session.playbackElapsedMs || 0) + (session.playbackResumedAt ? Math.max(0, now - session.playbackResumedAt) : 0);
+  }
+
   log(event, session = {}, extra = {}) {
     const chapterId = session.chapterId || extra.chapterId || DEFAULT_CHAPTER_ID;
     const chunkId = session.currentChunkId || extra.chunkId || "-";
@@ -1334,14 +1341,21 @@ export class PlaybackQueue {
     return getAllStoryMetadata();
   }
 
+  async getStoryMetadataRecord(storyId) {
+    if (!storyId) {
+      return null;
+    }
+    const records = await this.getStoryMetadataRecords().catch(() => []);
+    return (records || []).find((record) => record?.storyId === storyId) || null;
+  }
+
   async deleteStoryMetadataRecord(storyId) {
     return deleteStoryMetadata(storyId);
   }
 
   // --- "Continue where I left off" -----------------------------------------
-  // A per-story map of the last chapter and position the reader played, so the
-  // library can offer a Continue action that reopens the chapter page and
-  // resumes from there.
+  // A per-story playback cursor: chapter, chunk, and in-chunk offset. Used by
+  // library Continue, story-page Play, and same-chapter resume.
 
   async loadLastPlayed() {
     const values = await this.storageArea.get(LAST_PLAYED_KEY);
@@ -1366,12 +1380,16 @@ export class PlaybackQueue {
       return;
     }
     const map = await this.loadLastPlayed();
+    const chunkOffsetMs = Math.max(0, Math.round(session.currentChunkOffsetMs || 0));
+    const chapterOffsetMs = Math.max(chunkOffsetMs, Math.round(this.getSessionChapterOffsetMs(session, now)));
     map[session.storyId] = {
       storyId: session.storyId,
       chapterId: session.chapterId,
       chapterTitle: session.title || "",
       partUrl: session.sourceUrl || "",
       chunkIndex: typeof session.currentChunkIndex === "number" ? session.currentChunkIndex : 0,
+      chunkOffsetMs,
+      chapterOffsetMs,
       totalChunks: session.totalChunks || 0,
       updatedAt: now
     };
@@ -1392,6 +1410,150 @@ export class PlaybackQueue {
     }
   }
 
+  buildPlaybackCursorRecord(record = {}, overrides = {}) {
+    return {
+      storyId: record.storyId || null,
+      chapterId: record.chapterId || null,
+      chapterTitle: record.chapterTitle || record.title || "",
+      partUrl: record.partUrl || record.sourceUrl || "",
+      chunkIndex: typeof record.chunkIndex === "number" ? record.chunkIndex : 0,
+      chunkOffsetMs: Math.max(0, Math.round(record.chunkOffsetMs || 0)),
+      chapterOffsetMs: Math.max(
+        Math.round(record.chunkOffsetMs || 0),
+        Math.round(record.chapterOffsetMs || record.playbackElapsedMs || 0)
+      ),
+      totalChunks: record.totalChunks || 0,
+      updatedAt: record.updatedAt || Date.now(),
+      ...overrides
+    };
+  }
+
+  buildPlaybackCursorRecordFromSession(session = null, now = Date.now()) {
+    if (!session?.chapterId) {
+      return null;
+    }
+
+    return this.buildPlaybackCursorRecord({
+      storyId: session.storyId || null,
+      chapterId: session.chapterId,
+      chapterTitle: session.title || "",
+      partUrl: session.sourceUrl || "",
+      chunkIndex: typeof session.currentChunkIndex === "number" ? session.currentChunkIndex : 0,
+      chunkOffsetMs: session.currentChunkOffsetMs || 0,
+      chapterOffsetMs: this.getSessionChapterOffsetMs(session, now),
+      totalChunks: session.totalChunks || 0,
+      updatedAt: now
+    });
+  }
+
+  getPreferredCursorRecord(record = null, session = null, now = Date.now()) {
+    const normalizedRecord = record ? this.buildPlaybackCursorRecord(record) : null;
+    const sessionRecord = this.buildPlaybackCursorRecordFromSession(session, now);
+    if (!sessionRecord) {
+      return normalizedRecord;
+    }
+    if (!normalizedRecord) {
+      return sessionRecord;
+    }
+
+    if (sessionRecord.chapterId !== normalizedRecord.chapterId) {
+      return normalizedRecord;
+    }
+
+    if (sessionRecord.chapterOffsetMs > normalizedRecord.chapterOffsetMs) {
+      return sessionRecord;
+    }
+    if (
+      sessionRecord.chapterOffsetMs === normalizedRecord.chapterOffsetMs &&
+      sessionRecord.chunkIndex > normalizedRecord.chunkIndex
+    ) {
+      return sessionRecord;
+    }
+    if (
+      sessionRecord.chapterOffsetMs === normalizedRecord.chapterOffsetMs &&
+      sessionRecord.chunkIndex === normalizedRecord.chunkIndex &&
+      sessionRecord.chunkOffsetMs > normalizedRecord.chunkOffsetMs
+    ) {
+      return sessionRecord;
+    }
+
+    return normalizedRecord;
+  }
+
+  applyCursorRecordToSession(session, record = null) {
+    if (!session || !record?.chapterId) {
+      return session;
+    }
+
+    const chunkOffsetMs = Math.max(0, Math.round(record.chunkOffsetMs || 0));
+    const chapterOffsetMs = Math.max(
+      chunkOffsetMs,
+      Math.round(record.chapterOffsetMs || record.playbackElapsedMs || 0)
+    );
+
+    return {
+      ...session,
+      currentChunkIndex: Math.max(0, Math.round(record.chunkIndex || 0)),
+      currentChunkId: null,
+      currentChunkOffsetMs: chunkOffsetMs,
+      playbackElapsedMs: chapterOffsetMs,
+      playbackResumedAt: null,
+      playbackAttemptId: null,
+      lastCompletedChunkId: null,
+      retryCount: 0,
+      lastRetryReason: null,
+      lastRetryKind: null
+    };
+  }
+
+  getChunkOffsetFromPlaybackStatus(session, playbackStatus = null) {
+    if (!session?.currentChunkId || !playbackStatus) {
+      return Math.max(0, Math.round(session?.currentChunkOffsetMs || 0));
+    }
+
+    if (playbackStatus.chunkId === session.currentChunkId && typeof playbackStatus.playedAudioMs === "number") {
+      return Math.max(0, Math.round(playbackStatus.playedAudioMs));
+    }
+
+    const slot = playbackStatus?.slots?.find?.((entry) => entry?.chunkId === session.currentChunkId);
+    if (slot && typeof slot.playedAudioMs === "number") {
+      return Math.max(0, Math.round(slot.playedAudioMs));
+    }
+
+    return Math.max(0, Math.round(session.currentChunkOffsetMs || 0));
+  }
+
+  async resolveStoryStartRecord(context = {}) {
+    if (!context?.storyId) {
+      return null;
+    }
+
+    const cursor = await this.getLastPlayed(context.storyId);
+    if (cursor?.chapterId) {
+      return this.buildPlaybackCursorRecord(cursor, {
+        storyId: context.storyId
+      });
+    }
+
+    const metadata = await this.getStoryMetadataRecord(context.storyId);
+    const firstPart = context.firstPart || null;
+    const chapterId = firstPart?.partId || metadata?.firstPartId || null;
+    const partUrl = firstPart?.url || metadata?.firstPartUrl || "";
+    if (!chapterId || !partUrl) {
+      return null;
+    }
+
+    return this.buildPlaybackCursorRecord({
+      storyId: context.storyId,
+      chapterId,
+      chapterTitle: firstPart?.title || "",
+      partUrl,
+      chunkIndex: 0,
+      chunkOffsetMs: 0,
+      chapterOffsetMs: 0
+    });
+  }
+
   // Resumes the story's last-played chapter from where the reader left off.
   // Reuses an already-open chapter tab when possible; otherwise opens the
   // chapter's Wattpad page so the resume still registers as an organic visit.
@@ -1402,28 +1564,40 @@ export class PlaybackQueue {
       return { ok: false, storyId, error: "no_last_played" };
     }
 
-    await this.setActiveChapterId(lastPlayed.chapterId);
+    return this.resumeFromStoredRecord(this.buildPlaybackCursorRecord(lastPlayed, { storyId }));
+  }
 
-    const existing = await this.loadSession(lastPlayed.chapterId);
+  async resumeFromStoredRecord(record = {}, { alreadyExclusive = false } = {}) {
+    if (!record?.chapterId) {
+      return { ok: false, storyId: record?.storyId || null, error: "missing_chapter_id" };
+    }
+
+    await this.setActiveChapterId(record.chapterId);
+
+    const existing = await this.loadSession(record.chapterId);
     if (
       existing?.text &&
       existing.state !== "error" &&
       typeof existing.tabId === "number" &&
       (await this.prefetchTabExists(existing.tabId))
     ) {
+      const resumeRecord = this.getPreferredCursorRecord(record, existing);
       await this.activateResumedChapter({
-        chapterId: lastPlayed.chapterId,
+        chapterId: resumeRecord.chapterId,
         tabId: existing.tabId,
-        chunkIndex: lastPlayed.chunkIndex || 0
+        chunkIndex: resumeRecord.chunkIndex || 0,
+        chunkOffsetMs: resumeRecord.chunkOffsetMs || 0,
+        chapterOffsetMs: resumeRecord.chapterOffsetMs || 0,
+        alreadyExclusive
       });
-      return { ok: true, storyId, chapterId: lastPlayed.chapterId, resumed: "existing_tab" };
+      return { ok: true, storyId: resumeRecord.storyId || null, chapterId: resumeRecord.chapterId, resumed: "existing_tab" };
     }
 
-    if (!lastPlayed.partUrl) {
-      return { ok: false, storyId, error: "missing_chapter_url" };
+    if (!record.partUrl) {
+      return { ok: false, storyId: record.storyId || null, error: "missing_chapter_url" };
     }
-    const opened = await this.openResumeTarget(lastPlayed);
-    return { ok: opened, storyId, chapterId: lastPlayed.chapterId, resumed: "new_tab" };
+    const opened = await this.openResumeTarget(record);
+    return { ok: opened, storyId: record.storyId || null, chapterId: record.chapterId, resumed: "new_tab" };
   }
 
   async loadResumeRecord() {
@@ -1465,6 +1639,11 @@ export class PlaybackQueue {
         chapterId: lastPlayed.chapterId || null,
         url: lastPlayed.partUrl,
         chunkIndex: lastPlayed.chunkIndex || 0,
+        chunkOffsetMs: Math.max(0, Math.round(lastPlayed.chunkOffsetMs || 0)),
+        chapterOffsetMs: Math.max(
+          Math.round(lastPlayed.chunkOffsetMs || 0),
+          Math.round(lastPlayed.chapterOffsetMs || 0)
+        ),
         tabId: tab?.id ?? null,
         status: "opening",
         createdAt: Date.now()
@@ -1526,13 +1705,26 @@ export class PlaybackQueue {
     }
 
     await this.runPrefetchExclusive(() => this.clearResumeRecord());
-    await this.activateResumedChapter({ chapterId, tabId: record.tabId, chunkIndex: record.chunkIndex || 0 });
+    await this.activateResumedChapter({
+      chapterId,
+      tabId: record.tabId,
+      chunkIndex: record.chunkIndex || 0,
+      chunkOffsetMs: record.chunkOffsetMs || 0,
+      chapterOffsetMs: record.chapterOffsetMs || 0
+    });
   }
 
   // Starts the resumed chapter playing from the saved chunk. Goes straight
   // through processSession (not the popup start path) because the tab is
   // already focused, so the off-page playback gate does not apply.
-  async activateResumedChapter({ chapterId, tabId = null, chunkIndex = 0 }) {
+  async activateResumedChapter({
+    chapterId,
+    tabId = null,
+    chunkIndex = 0,
+    chunkOffsetMs = 0,
+    chapterOffsetMs = 0,
+    alreadyExclusive = false
+  }) {
     if (!chapterId) {
       return false;
     }
@@ -1540,13 +1732,15 @@ export class PlaybackQueue {
     await this.focusSessionTab({ tabId });
     await this.setActiveChapterId(chapterId);
 
-    return this.runExclusive(async () => {
+    const run = async () => {
       const session = await this.loadSession(chapterId);
       if (!session?.text || session.state === "error") {
         return false;
       }
       const maxIndex = Math.max(0, (session.totalChunks || 1) - 1);
       const targetIndex = Math.min(Math.max(0, chunkIndex), maxIndex);
+      const targetChunkOffsetMs = Math.max(0, Math.round(chunkOffsetMs || 0));
+      const targetChapterOffsetMs = Math.max(targetChunkOffsetMs, Math.round(chapterOffsetMs || 0));
       const startedSession = {
         ...session,
         tabId: typeof tabId === "number" ? tabId : session.tabId || null,
@@ -1555,10 +1749,13 @@ export class PlaybackQueue {
         playRequested: true,
         currentChunkIndex: targetIndex,
         currentChunkId: null,
+        currentChunkOffsetMs: targetChunkOffsetMs,
         playbackAttemptId: null,
         state: "playback_starting",
         playbackStatus: "idle",
         streamStatus: "idle",
+        playbackElapsedMs: targetChapterOffsetMs,
+        playbackResumedAt: null,
         playBlockedOffPage: false,
         focusTabOnPlay: false,
         lastEvent: "resumed_from_last_played",
@@ -1568,9 +1765,15 @@ export class PlaybackQueue {
       await this.ensureOffscreenDocument();
       this.interruptWarmupFetches();
       await this.processSession(chapterId);
-      this.log("resumed_from_last_played", startedSession, { chapterId, chunkIndex: targetIndex });
+      this.log("resumed_from_last_played", startedSession, {
+        chapterId,
+        chunkIndex: targetIndex,
+        chunkOffsetMs: targetChunkOffsetMs
+      });
       return true;
-    });
+    };
+
+    return alreadyExclusive ? run() : this.runExclusive(run);
   }
 
   // --- Sleep timer ---------------------------------------------------------
@@ -2071,6 +2274,7 @@ export class PlaybackQueue {
       playbackStatus: "idle",
       currentChunkIndex: 0,
       currentChunkId: null,
+      currentChunkOffsetMs: 0,
       totalChunks: 0,
       pageDetected: playbackInput.pageDetected ?? true,
       pageEligible: playbackInput.pageEligible ?? true,
@@ -2111,6 +2315,7 @@ export class PlaybackQueue {
       playbackStatus: "idle",
       currentChunkIndex: 0,
       currentChunkId: null,
+      currentChunkOffsetMs: 0,
       playbackAttemptId: null,
       retryCount: 0,
       lastRetryReason: null,
@@ -2165,9 +2370,45 @@ export class PlaybackQueue {
     return this.runExclusive(() => this.startExclusive(options));
   }
 
+  async startFromStoryContext(context = {}) {
+    const record = await this.resolveStoryStartRecord(context);
+    if (!record?.chapterId) {
+      return this.getState(await this.getActiveChapterId());
+    }
+
+    await this.resumeFromStoredRecord(record, { alreadyExclusive: true });
+    return this.getState(record.chapterId);
+  }
+
   async startExclusive(options = {}) {
-    const activeChapterId = await this.resolveChapterId(options.chapterId || null);
+    const pageContext = options.chapterId
+      ? { kind: "none", ok: false }
+      : await this.getPageContext(typeof options.tabId === "number" ? options.tabId : null).catch(() => ({
+          kind: "none",
+          ok: false
+        }));
+
+    if (pageContext.kind === "story" && pageContext.storyId) {
+      return this.startFromStoryContext(pageContext);
+    }
+
+    const activeChapterId =
+      options.chapterId ||
+      (pageContext.kind === "chapter" && pageContext.partId ? pageContext.partId : null) ||
+      (await this.getActiveChapterId());
+    if (pageContext.kind === "chapter" && pageContext.partId) {
+      await this.setActiveChapterId(activeChapterId);
+    }
+
     const existingSession = await this.loadSession(activeChapterId);
+    const storyId = pageContext.kind === "chapter" ? pageContext.storyId || existingSession?.storyId || null : existingSession?.storyId || null;
+    const storyCursor = storyId ? await this.getLastPlayed(storyId) : null;
+    const shouldRestartFromChapterStart = Boolean(
+      pageContext.kind === "chapter" && storyCursor?.chapterId && String(storyCursor.chapterId) !== String(activeChapterId)
+    );
+    const shouldResumeFromStoryCursor = Boolean(
+      pageContext.kind === "chapter" && storyCursor?.chapterId && String(storyCursor.chapterId) === String(activeChapterId)
+    );
 
     // The resume/restart branches below replay a stored chapter that may no
     // longer be in front of the reader; gate them on actually viewing the
@@ -2183,7 +2424,7 @@ export class PlaybackQueue {
       return this.buildOffPagePlaybackBlock(activeChapterId, existingSession);
     }
 
-    if (existingSession?.state === "paused" && !existingSession.stopped) {
+    if (existingSession?.state === "paused" && !existingSession.stopped && !shouldRestartFromChapterStart) {
       const resumeResponse = await this.resumeOffscreenPlayback();
       if (resumeResponse?.ok && resumeResponse.resumed) {
         const hasStarted = Boolean(existingSession.hasStartedPlayback);
@@ -2209,7 +2450,7 @@ export class PlaybackQueue {
 
     if (existingSession?.text && existingSession.state !== "error") {
       const wasPaused = existingSession.state === "paused";
-      const resumedWarmSession = existingSession.stopped || existingSession.state === "ended"
+      let resumedWarmSession = existingSession.stopped || existingSession.state === "ended"
         ? this.createRestartedSession(existingSession, {
             tabId: options.tabId || existingSession.tabId || null,
             playRequested: true,
@@ -2232,6 +2473,34 @@ export class PlaybackQueue {
             errorMessage: null,
             playBlockedOffPage: false
           };
+
+      if (shouldRestartFromChapterStart) {
+        resumedWarmSession = this.createRestartedSession(existingSession, {
+          tabId: options.tabId || existingSession.tabId || null,
+          playRequested: true,
+          lastEvent: "play_requested_from_chapter_start",
+          playBlockedOffPage: false
+        });
+      } else if (shouldResumeFromStoryCursor && storyCursor) {
+        resumedWarmSession = this.applyCursorRecordToSession(
+          resumedWarmSession,
+          this.getPreferredCursorRecord(storyCursor, existingSession)
+        );
+        resumedWarmSession = {
+          ...resumedWarmSession,
+          tabId: options.tabId || existingSession.tabId || null,
+          playRequested: true,
+          paused: false,
+          stopped: false,
+          state: "playback_starting",
+          playbackStatus: "idle",
+          streamStatus: "idle",
+          lastEvent: "play_requested_from_story_cursor",
+          errorMessage: null,
+          playBlockedOffPage: false
+        };
+      }
+
       if (existingSession.focusTabOnPlay) {
         // A backfilled chapter 1 lives in a background tab; the spec switches
         // to it only when the user actually hits Play.
@@ -2258,11 +2527,14 @@ export class PlaybackQueue {
       playRequested: true,
       lastEvent: "session_created"
     });
+    const preparedSession = shouldResumeFromStoryCursor && storyCursor
+      ? this.applyCursorRecordToSession(nextSession, storyCursor)
+      : nextSession;
 
     await this.cleanupExpiredAudioRecords();
     await this.ensureOffscreenDocument();
-    await this.ensureChapterData(nextSession);
-    await this.saveSession(nextSession);
+    await this.ensureChapterData(preparedSession);
+    await this.saveSession(preparedSession);
     this.interruptWarmupFetches();
     await this.processSession(chapterId);
 
@@ -2344,16 +2616,23 @@ export class PlaybackQueue {
       return this.getState(resolvedChapterId);
     }
 
+    const playbackStatus = await this.queryOffscreenPlaybackStatus();
+    const currentChunkOffsetMs = this.getChunkOffsetFromPlaybackStatus(session, playbackStatus);
     const pausedSession = {
-      ...this.foldPlaybackClock(session),
+      ...this.foldPlaybackClock({
+        ...session,
+        currentChunkOffsetMs
+      }),
       paused: true,
       playRequested: false,
       state: "paused",
       playbackStatus: "paused",
       streamStatus: "paused",
+      currentChunkOffsetMs,
       lastEvent: "session_paused"
     };
     await this.saveSession(pausedSession);
+    await this.recordLastPlayed(pausedSession).catch(() => {});
     await this.runtimeApi.sendMessage({ type: "PAUSE_PLAYBACK" });
     // Pause ends any playback startup, so parked warmups may run again.
     this.resumePendingWarmups();
@@ -2368,17 +2647,24 @@ export class PlaybackQueue {
     const resolvedChapterId = await this.resolveChapterId(chapterId);
     const session = await this.loadSession(resolvedChapterId);
     if (session) {
+      const playbackStatus = await this.queryOffscreenPlaybackStatus();
+      const currentChunkOffsetMs = this.getChunkOffsetFromPlaybackStatus(session, playbackStatus);
       const stoppedSession = {
-        ...this.foldPlaybackClock(session),
+        ...this.foldPlaybackClock({
+          ...session,
+          currentChunkOffsetMs
+        }),
         stopped: true,
         playRequested: false,
         state: "ended",
         playbackStatus: "ended",
         streamStatus: "ended",
         currentChunkId: null,
+        currentChunkOffsetMs,
         lastEvent: "session_stopped"
       };
       await this.saveSession(stoppedSession);
+      await this.recordLastPlayed(stoppedSession).catch(() => {});
       await this.clearChunkFocus(stoppedSession).catch(() => {});
     }
     await this.runtimeApi.sendMessage({ type: "STOP_PLAYBACK" });
@@ -2505,6 +2791,7 @@ export class PlaybackQueue {
       return true;
     }
 
+    const startOffsetMs = Math.max(0, Math.round(session.currentChunkOffsetMs || 0));
     const offscreenStatus = await this.queryOffscreenPlaybackStatus();
     const offscreenSlot = this.getPreparedSlotSnapshot(offscreenStatus, chunk.chunkId);
     if (offscreenSlot?.role === "active" && (offscreenSlot.streamStatus === "paused" || offscreenSlot.paused)) {
@@ -2559,14 +2846,16 @@ export class PlaybackQueue {
           chunkId: chunk.chunkId,
           chapterId,
           attemptId,
-          request
+          request,
+          startOffsetMs
         });
         if (!response?.ok) {
           response = await this.dispatchStreamPlayback({
             chunkId: chunk.chunkId,
             chapterId,
             attemptId,
-            request
+            request,
+            startOffsetMs
           });
         }
       } else {
@@ -2574,7 +2863,8 @@ export class PlaybackQueue {
           chunkId: chunk.chunkId,
           chapterId,
           attemptId,
-          request
+          request,
+          startOffsetMs
         });
       }
       if (!response?.ok) {
@@ -2645,7 +2935,12 @@ export class PlaybackQueue {
         nextFirstByteAt !== (session.firstByteAt || null) || nextFirstAudioAt !== (session.firstAudioAt || null);
       const bytesDelta = Math.abs((message.bytesReceived || 0) - (session.bytesReceived || 0));
       const bufferedDelta = Math.abs((message.bufferedAudioMs || 0) - (session.bufferedAudioMs || 0));
-      if (!statusChanged && !timestampsChanged && bytesDelta < 65536 && bufferedDelta < 1000) {
+      const nextChunkOffsetMs =
+        typeof message.playedAudioMs === "number"
+          ? Math.max(0, Math.round(message.playedAudioMs))
+          : Math.max(0, Math.round(session.currentChunkOffsetMs || 0));
+      const chunkOffsetDelta = Math.abs(nextChunkOffsetMs - Math.round(session.currentChunkOffsetMs || 0));
+      if (!statusChanged && !timestampsChanged && bytesDelta < 65536 && bufferedDelta < 1000 && chunkOffsetDelta < 1000) {
         return;
       }
 
@@ -2654,6 +2949,7 @@ export class PlaybackQueue {
         streamStatus: nextStreamStatus,
         bytesReceived: message.bytesReceived || 0,
         bufferedAudioMs: message.bufferedAudioMs || 0,
+        currentChunkOffsetMs: nextChunkOffsetMs,
         firstByteAt: nextFirstByteAt,
         firstAudioAt: nextFirstAudioAt,
         stallCount:
@@ -2698,6 +2994,10 @@ export class PlaybackQueue {
         streamStatus: "playing",
         bytesReceived: message.bytesReceived || session.bytesReceived || 0,
         bufferedAudioMs: message.bufferedAudioMs || session.bufferedAudioMs || 0,
+        currentChunkOffsetMs:
+          typeof message.playedAudioMs === "number"
+            ? Math.max(0, Math.round(message.playedAudioMs))
+            : Math.max(0, Math.round(session.currentChunkOffsetMs || 0)),
         firstByteAt: message.firstByteAt || session.firstByteAt || Date.now(),
         firstAudioAt: message.firstAudioAt || session.firstAudioAt || Date.now(),
         playbackResumedAt: session.playbackResumedAt || Date.now()
@@ -2721,7 +3021,8 @@ export class PlaybackQueue {
         ...advancedSession,
         streamStatus: advancedSession.state === "ended" ? "ended" : "idle",
         bytesReceived: 0,
-        bufferedAudioMs: 0
+        bufferedAudioMs: 0,
+        currentChunkOffsetMs: 0
       };
       await this.saveSession(savedSession);
       const sleepTimer = await this.loadSleepTimer();

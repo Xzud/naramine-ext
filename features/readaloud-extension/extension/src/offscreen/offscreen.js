@@ -20,6 +20,7 @@ let playbackState = {
   bufferedAudioMs: 0,
   firstByteAt: null,
   firstAudioAt: null,
+  playedAudioMs: 0,
   transportMode: "live_stream"
 };
 
@@ -84,6 +85,7 @@ function syncActivePlayback(slot, status, overrides = {}) {
     bufferedAudioMs: status?.bufferedAudioMs || 0,
     firstByteAt: status?.firstByteAt || null,
     firstAudioAt: status?.firstAudioAt || null,
+    playedAudioMs: status?.playedAudioMs || 0,
     ...overrides
   });
 }
@@ -154,7 +156,8 @@ function createSlotCallbacks(slot) {
         bytesReceived: playbackState.bytesReceived,
         bufferedAudioMs: playbackState.bufferedAudioMs,
         firstByteAt: playbackState.firstByteAt,
-        firstAudioAt: playbackState.firstAudioAt
+        firstAudioAt: playbackState.firstAudioAt,
+        playedAudioMs: playbackState.playedAudioMs
       });
     },
     onFirstByte: () => {
@@ -167,7 +170,8 @@ function createSlotCallbacks(slot) {
         bytesReceived: playbackState.bytesReceived,
         bufferedAudioMs: playbackState.bufferedAudioMs,
         firstByteAt: playbackState.firstByteAt,
-        firstAudioAt: playbackState.firstAudioAt
+        firstAudioAt: playbackState.firstAudioAt,
+        playedAudioMs: playbackState.playedAudioMs
       });
     },
     onReady: (status) => {
@@ -178,7 +182,8 @@ function createSlotCallbacks(slot) {
           bytesReceived: playbackState.bytesReceived,
           bufferedAudioMs: playbackState.bufferedAudioMs,
           firstByteAt: playbackState.firstByteAt,
-          firstAudioAt: playbackState.firstAudioAt
+          firstAudioAt: playbackState.firstAudioAt,
+          playedAudioMs: playbackState.playedAudioMs
         });
         return;
       }
@@ -190,7 +195,8 @@ function createSlotCallbacks(slot) {
           bytesReceived: status?.bytesReceived || 0,
           bufferedAudioMs: status?.bufferedAudioMs || 0,
           firstByteAt: status?.firstByteAt || null,
-          firstAudioAt: status?.firstAudioAt || null
+          firstAudioAt: status?.firstAudioAt || null,
+          playedAudioMs: status?.playedAudioMs || 0
         },
         { chunkId: slot.chunkId, attemptId: slot.attemptId }
       );
@@ -205,7 +211,8 @@ function createSlotCallbacks(slot) {
         bytesReceived: playbackState.bytesReceived,
         bufferedAudioMs: playbackState.bufferedAudioMs,
         firstByteAt: playbackState.firstByteAt,
-        firstAudioAt: playbackState.firstAudioAt
+        firstAudioAt: playbackState.firstAudioAt,
+        playedAudioMs: playbackState.playedAudioMs
       });
     },
     onProgress: (status) => {
@@ -218,7 +225,8 @@ function createSlotCallbacks(slot) {
         bytesReceived: playbackState.bytesReceived,
         bufferedAudioMs: playbackState.bufferedAudioMs,
         firstByteAt: playbackState.firstByteAt,
-        firstAudioAt: playbackState.firstAudioAt
+        firstAudioAt: playbackState.firstAudioAt,
+        playedAudioMs: playbackState.playedAudioMs
       });
     },
     onEnded: async (status) => {
@@ -254,7 +262,8 @@ function createSlotCallbacks(slot) {
         bytesReceived: 0,
         bufferedAudioMs: 0,
         firstByteAt: null,
-        firstAudioAt: null
+        firstAudioAt: null,
+        playedAudioMs: 0
       });
     },
     onError: async (error) => {
@@ -313,7 +322,8 @@ async function stopAllSlots() {
     bytesReceived: 0,
     bufferedAudioMs: 0,
     firstByteAt: null,
-    firstAudioAt: null
+    firstAudioAt: null,
+    playedAudioMs: 0
   });
 
   for (const slot of slots) {
@@ -347,7 +357,8 @@ async function clearActiveSlot() {
     bytesReceived: 0,
     bufferedAudioMs: 0,
     firstByteAt: null,
-    firstAudioAt: null
+    firstAudioAt: null,
+    playedAudioMs: 0
   });
 }
 
@@ -363,7 +374,8 @@ function createSlot(message, role, cachedAudio = null) {
   const callbacks = createSlotCallbacks(slot);
   const player = new WavStreamPlayer(callbacks, {
     autoStart: role === "active",
-    startBufferMs: role === "prepared" ? STREAM_READY_BUFFER_MS : undefined
+    startBufferMs: role === "prepared" ? STREAM_READY_BUFFER_MS : undefined,
+    startOffsetMs: Math.max(0, Math.round(message.startOffsetMs || 0))
   });
   slot.player = player;
   streamSlots.set(slot.chunkId, slot);
@@ -425,6 +437,11 @@ async function promotePreparedStream(message) {
     };
   }
 
+  if (message.startOffsetMs > 0) {
+    await stopSlot(slot);
+    return startLiveStream(message);
+  }
+
   slot.role = "active";
   slot.attemptId = message.attemptId || slot.attemptId;
   activeChunkId = slot.chunkId;
@@ -439,7 +456,8 @@ async function promotePreparedStream(message) {
     bytesReceived: playbackState.bytesReceived,
     bufferedAudioMs: playbackState.bufferedAudioMs,
     firstByteAt: playbackState.firstByteAt,
-    firstAudioAt: playbackState.firstAudioAt
+    firstAudioAt: playbackState.firstAudioAt,
+    playedAudioMs: playbackState.playedAudioMs
   });
   return {
     ok: true,
@@ -476,7 +494,8 @@ async function startLiveStream(message) {
   setPlaybackState({
     chunkId: slot.chunkId,
     attemptId: slot.attemptId,
-    streamStatus: "connecting"
+    streamStatus: "connecting",
+    playedAudioMs: Math.max(0, Math.round(message.startOffsetMs || 0))
   });
   return {
     ok: true,
