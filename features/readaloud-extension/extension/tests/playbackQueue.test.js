@@ -2799,6 +2799,34 @@ test("library uses scraped story metadata for title, author, and cover", async (
   assert.equal(library.stories[0].author, "AuthorName");
   assert.equal(library.stories[0].coverUrl, "https://img.wattpad.com/cover.jpg");
   assert.equal(savedMetadata[0].firstPartUrl, "https://www.wattpad.com/111-ch1");
+  assert.equal(queue.createdTabs.length, 0);
+});
+
+test("story page load with sync already on starts chapter 1 buffering immediately", async () => {
+  const queue = new TestPlaybackQueue();
+  queue.saveStoryMetadataRecord = async () => {};
+  queue.getChapterRecord = async () => null;
+  await queue.storageArea.set({
+    "readaloud:syncStories": { "story-meta": { enabled: true, enabledAt: 1 } }
+  });
+
+  const response = await queue.handleStoryPageReady({
+    storyId: "story-meta",
+    title: "Proper Story Title",
+    author: "AuthorName",
+    coverUrl: "https://img.wattpad.com/cover.jpg",
+    avatarUrl: "https://img.wattpad.com/avatar.jpg",
+    sourceUrl: "https://www.wattpad.com/story/42-proper-story-title",
+    firstPart: { partId: "111", url: "https://www.wattpad.com/111-ch1", title: "" }
+  });
+
+  assert.equal(response.ok, true);
+  assert.deepEqual(queue.createdTabs.map((tab) => tab.url), ["https://www.wattpad.com/111-ch1"]);
+  assert.equal(queue.createdTabs[0].active, false);
+  const backfillRecord = await queue.loadBackfillRecord();
+  assert.equal(backfillRecord.storyId, "story-meta");
+  assert.equal(backfillRecord.partId, "111");
+  assert.equal(backfillRecord.url, "https://www.wattpad.com/111-ch1");
 });
 
 test("deleting a story turns its sync off and drops its metadata", async () => {

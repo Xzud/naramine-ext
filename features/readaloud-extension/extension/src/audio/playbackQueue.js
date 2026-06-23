@@ -1142,13 +1142,7 @@ export class PlaybackQueue {
     return { ok: true, storyId, enabled, kind: context.kind };
   }
 
-  // Runs the Sync-On kickoff ordering from the page the user toggled on:
-  // the focused chapter, then a chapter-1 backfill, then the next chapter.
-  async startSyncFromContext(context) {
-    if (context.kind === "story") {
-      await this.handleStoryPageReady(context).catch(() => {});
-    }
-
+  async executeSyncPlan(context) {
     for (const step of planSyncStart(context)) {
       if (step.action === "warm-current") {
         // warmup notices the now-enabled sync flag and starts the download
@@ -1169,6 +1163,15 @@ export class PlaybackQueue {
         }
       }
     }
+  }
+
+  // Runs the Sync-On kickoff ordering from the page the user toggled on:
+  // the focused chapter, then a chapter-1 backfill, then the next chapter.
+  async startSyncFromContext(context) {
+    if (context.kind === "story") {
+      await this.handleStoryPageReady(context).catch(() => {});
+    }
+    await this.executeSyncPlan(context);
   }
 
   // With Sync on for the story, every visited chapter downloads fully and
@@ -1318,8 +1321,9 @@ export class PlaybackQueue {
     }
   }
 
-  // Novel-page visits only record metadata (name, cover, author, avatar);
-  // downloads start from chapter visits or the Sync-On trigger.
+  // Story-page visits always record metadata, and if Sync was already on for
+  // the story they also kick off the same chapter-1 buffering plan that
+  // turning Sync on from the story page would have used.
   async handleStoryPageReady(payload = {}) {
     if (!payload?.storyId) {
       return { ok: false, error: "missing_story_id" };
@@ -1335,6 +1339,14 @@ export class PlaybackQueue {
       firstPartUrl: payload.firstPart?.url || null,
       updatedAt: Date.now()
     });
+
+    if (await this.isSyncEnabled(payload.storyId)) {
+      await this.executeSyncPlan({
+        kind: "story",
+        ...payload
+      });
+    }
+
     return { ok: true, storyId: payload.storyId };
   }
 
