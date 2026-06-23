@@ -1,4 +1,5 @@
 import { createUnavailableRuntimeState } from "../audio/runtimeState.js";
+import { VOICE_OPTIONS } from "../shared/userSettings.js";
 import {
   buildGuideViewModel,
   buildLibraryViewModel,
@@ -25,6 +26,7 @@ let libraryOpen = false;
 let confirmResetTimer = null;
 let syncStatus = null;
 let sleepStatus = null;
+let voiceSwitchPending = false;
 // What the active tab is ({ kind: "chapter" | "story" | "none", ... }). Drives
 // whether the popup shows the player or the "open a story" guide.
 let pageContext = null;
@@ -58,6 +60,46 @@ function openSettingsPage() {
   }
 }
 
+function ensureVoiceSelectOptions() {
+  const select = document.getElementById("voiceSelect");
+  if (!select || select.options.length) {
+    return;
+  }
+  select.replaceChildren(
+    ...VOICE_OPTIONS.map((option) => {
+      const element = document.createElement("option");
+      element.value = option.id;
+      element.textContent = `${option.label} (${option.id})`;
+      return element;
+    })
+  );
+}
+
+function renderVoiceSwitcher(view) {
+  const panel = document.getElementById("voicePanel");
+  const current = document.getElementById("voiceCurrent");
+  const select = document.getElementById("voiceSelect");
+  if (!panel || !current || !select) {
+    return;
+  }
+
+  ensureVoiceSelectOptions();
+
+  const visible = Boolean(view.currentVoiceId);
+  panel.hidden = !visible;
+  if (!visible) {
+    return;
+  }
+
+  current.textContent = view.currentVoiceLabel
+    ? `${view.currentVoiceLabel} (${view.currentVoiceId})`
+    : view.currentVoiceId;
+  if (select.value !== view.currentVoiceId) {
+    select.value = view.currentVoiceId;
+  }
+  select.disabled = voiceSwitchPending;
+}
+
 function render() {
   const view = buildPopupViewModel(lastState, Date.now());
 
@@ -77,6 +119,8 @@ function render() {
   const error = document.getElementById("error");
   error.hidden = !view.errorMessage;
   error.textContent = view.errorMessage || "";
+
+  renderVoiceSwitcher(view);
 }
 
 function createDeleteButton(label, dataset) {
@@ -86,6 +130,20 @@ function createDeleteButton(label, dataset) {
   button.setAttribute("aria-label", label);
   button.title = label;
   Object.assign(button.dataset, dataset);
+  return button;
+}
+
+function createVoiceDeleteButton(chapter, voice) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `voice-pill${voice.isActive ? " active" : ""}${voice.isDownloaded ? "" : " partial"}`;
+  button.textContent = voice.label;
+  button.title = `Delete ${voice.label} for ${chapter.title}`;
+  button.dataset.action = "delete-voice";
+  button.dataset.chapterId = chapter.chapterId;
+  button.dataset.voiceId = voice.voiceId;
+  button.dataset.variantChapterId = voice.variantChapterId;
+  button.dataset.defaultLabel = voice.label;
   return button;
 }
 
@@ -113,7 +171,15 @@ function renderChapter(chapter) {
 
   meta.append(badge, details);
   info.append(title, meta);
-  row.append(info, createDeleteButton(`Delete audio for ${chapter.title}`, { chapterId: chapter.chapterId }));
+
+  if (Array.isArray(chapter.voices) && chapter.voices.length > 0) {
+    const voices = document.createElement("div");
+    voices.className = "voice-pill-row";
+    voices.append(...chapter.voices.map((voice) => createVoiceDeleteButton(chapter, voice)));
+    info.append(voices);
+  }
+
+  row.append(info);
   return row;
 }
 
@@ -148,7 +214,13 @@ function renderStory(story, openStoryIds) {
   storySummary.textContent = story.summary;
 
   heading.append(title, storySummary);
-  summary.append(heading, createDeleteButton(`Delete all audio for ${story.title}`, { storyId: story.storyId }));
+  summary.append(
+    heading,
+    createDeleteButton(`Delete all audio for ${story.title}`, {
+      storyId: story.storyId,
+      action: "delete-story"
+    })
+  );
   group.append(summary);
 
   if (story.continue) {
@@ -194,7 +266,7 @@ function renderLibrary(library, { force = false } = {}) {
   // Skip the refresh while a delete confirmation is pending so the poll does
   // not wipe the "Delete?" button out from under the user's second click.
   const list = document.getElementById("libraryList");
-  if (!force && list.querySelector(".delete-button.confirming")) {
+  if (!force && list.querySelector(".delete-button.confirming, .voice-pill.confirming")) {
     return;
   }
   lastLibrarySignature = signature;
@@ -289,9 +361,13 @@ async function refreshPageContext() {
 }
 
 function resetConfirmingButtons() {
-  for (const button of document.querySelectorAll(".delete-button.confirming")) {
+  for (const button of document.querySelectorAll(".delete-button.confirming, .voice-pill.confirming")) {
     button.classList.remove("confirming");
-    button.innerHTML = TRASH_ICON;
+    if (button.classList.contains("voice-pill")) {
+      button.textContent = button.dataset.defaultLabel || button.textContent;
+    } else {
+      button.innerHTML = TRASH_ICON;
+    }
   }
 }
 
@@ -299,7 +375,9 @@ async function handleDeleteClick(button) {
   if (!button.classList.contains("confirming")) {
     resetConfirmingButtons();
     button.classList.add("confirming");
-    button.textContent = "Delete?";
+    button.textContent = button.classList.contains("voice-pill")
+      ? `Delete ${button.dataset.defaultLabel || "voice"}?`
+      : "Delete?";
     clearTimeout(confirmResetTimer);
     confirmResetTimer = setTimeout(resetConfirmingButtons, CONFIRM_RESET_MS);
     return;
@@ -307,10 +385,11 @@ async function handleDeleteClick(button) {
 
   clearTimeout(confirmResetTimer);
   button.disabled = true;
-  const { chapterId, storyId } = button.dataset;
-  const library = chapterId
-    ? await request("LIBRARY_DELETE_CHAPTER", { chapterId })
-    : await request("LIBRARY_DELETE_STORY", { storyId });
+  const { action, chapterId, storyId, voiceId, variantChapterId } = button.dataset;
+  const library =
+    action === "delete-voice"
+      ? await request("LIBRARY_DELETE_CHAPTER_VOICE", { chapterId, voiceId, variantChapterId })
+      : await request("LIBRARY_DELETE_STORY", { storyId });
   if (Array.isArray(library?.stories)) {
     renderLibrary(library, { force: true });
   } else {
@@ -414,6 +493,20 @@ document.getElementById("play")?.addEventListener("click", async () => {
   render();
 });
 
+document.getElementById("voiceSelect")?.addEventListener("change", async (event) => {
+  const select = event.target;
+  if (!select?.value || select.value === lastState?.voice) {
+    render();
+    return;
+  }
+
+  voiceSwitchPending = true;
+  render();
+  lastState = await request("PLAYBACK_SET_VOICE", { voiceId: select.value });
+  voiceSwitchPending = false;
+  render();
+});
+
 document.getElementById("stop")?.addEventListener("click", async () => {
   lastState = await request("STOP");
   render();
@@ -508,7 +601,7 @@ document.getElementById("libraryList")?.addEventListener("click", (event) => {
     return;
   }
 
-  const button = event.target.closest?.(".delete-button");
+  const button = event.target.closest?.(".delete-button, .voice-pill");
   if (!button) {
     return;
   }

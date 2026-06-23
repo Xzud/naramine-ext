@@ -1,3 +1,5 @@
+import { findVoiceOption } from "../shared/userSettings.js";
+
 const PAUSEABLE_PLAYBACK_STATUSES = new Set(["dispatching", "starting", "playing", "awaiting_chunk_end"]);
 
 export function isPauseable(state) {
@@ -75,11 +77,13 @@ export function formatBytes(bytes) {
 
 function buildChapterMeta(chapter) {
   const size = formatBytes(chapter.sizeBytes);
+  const voiceCount = Math.max(0, chapter.voiceCount || chapter.voices?.length || 0);
+  const voiceSummary = voiceCount > 0 ? `${voiceCount} voice${voiceCount === 1 ? "" : "s"}` : null;
   if (chapter.status === "downloaded") {
-    return size;
+    return [voiceSummary, size].filter(Boolean).join(" · ") || size;
   }
   const percent = chapter.chunkCount > 0 ? Math.floor((chapter.readyAudioCount / chapter.chunkCount) * 100) : 0;
-  return `${Math.min(99, percent)}% downloaded · ${size}`;
+  return [`${Math.min(99, percent)}% downloaded`, voiceSummary, size].filter(Boolean).join(" · ");
 }
 
 function buildContinueLabel(lastPlayed) {
@@ -118,7 +122,18 @@ export function buildLibraryViewModel(library) {
         status: chapter.status,
         statusLabel: LIBRARY_STATUS_LABELS[chapter.status] || chapter.status,
         isActive: Boolean(chapter.isActive),
-        meta: buildChapterMeta(chapter)
+        meta: buildChapterMeta(chapter),
+        voices: (Array.isArray(chapter.variants) ? chapter.variants : []).map((variant) => {
+          const option = findVoiceOption(variant.voiceId);
+          return {
+            voiceId: variant.voiceId || "",
+            label: option?.label || variant.voiceId || "Unknown",
+            family: option?.family || "",
+            variantChapterId: variant.variantChapterId || chapter.chapterId,
+            isActive: Boolean(variant.isActive),
+            isDownloaded: Boolean(variant.isDownloaded)
+          };
+        })
       }))
     }))
   };
@@ -201,6 +216,8 @@ export function buildPopupViewModel(state, now = Date.now()) {
     timerRunning: Boolean(available && state.playbackResumedAt),
     warmedRatio: getWarmedRatio(state),
     chapterRatio: getChapterRatio(state),
-    errorMessage: showMessage ? state?.errorMessage || state?.unavailableReason || null : null
+    errorMessage: showMessage ? state?.errorMessage || state?.unavailableReason || null : null,
+    currentVoiceId: available ? state?.voice || null : null,
+    currentVoiceLabel: available ? findVoiceOption(state?.voice)?.label || state?.voice || null : null
   };
 }

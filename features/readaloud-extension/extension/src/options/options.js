@@ -145,6 +145,20 @@ function createActionButton({ label, className, action, storyId = "", chapterId 
   return button;
 }
 
+function createVoiceActionButton(chapter, voice) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = `voice-chip${voice.isActive ? " active" : ""}${voice.isDownloaded ? "" : " partial"}`;
+  button.textContent = voice.label;
+  button.dataset.action = "delete-voice";
+  button.dataset.chapterId = chapter.chapterId;
+  button.dataset.voiceId = voice.voiceId;
+  button.dataset.variantChapterId = voice.variantChapterId;
+  button.dataset.defaultLabel = voice.label;
+  button.setAttribute("aria-label", `Delete ${voice.label} for ${chapter.title}`);
+  return button;
+}
+
 function createChapterRow(chapter) {
   const row = document.createElement("div");
   row.className = "chapter-row";
@@ -170,15 +184,14 @@ function createChapterRow(chapter) {
   meta.append(badge, details);
   copy.append(title, meta);
 
-  const deleteButton = createActionButton({
-    label: "Delete",
-    className: "button-danger chapter-delete",
-    action: "delete-chapter",
-    chapterId: chapter.chapterId
-  });
-  deleteButton.setAttribute("aria-label", `Delete ${chapter.title}`);
+  if (Array.isArray(chapter.voices) && chapter.voices.length > 0) {
+    const voices = document.createElement("div");
+    voices.className = "voice-chip-row";
+    voices.append(...chapter.voices.map((voice) => createVoiceActionButton(chapter, voice)));
+    copy.append(voices);
+  }
 
-  row.append(copy, deleteButton);
+  row.append(copy);
   return row;
 }
 
@@ -254,7 +267,7 @@ function renderLibrary(library, { force = false } = {}) {
   if (!force && signature === lastLibrarySignature) {
     return;
   }
-  if (!force && list.querySelector(".button-danger.confirming")) {
+  if (!force && list.querySelector(".button-danger.confirming, .voice-chip.confirming")) {
     return;
   }
 
@@ -280,7 +293,7 @@ async function refreshLibrary(options = {}) {
 }
 
 function resetConfirmingButtons() {
-  for (const button of document.querySelectorAll(".button-danger.confirming")) {
+  for (const button of document.querySelectorAll(".button-danger.confirming, .voice-chip.confirming")) {
     button.classList.remove("confirming");
     button.textContent = button.dataset.defaultLabel || "Delete";
   }
@@ -291,7 +304,12 @@ async function handleDeleteAction(button) {
     resetConfirmingButtons();
     button.classList.add("confirming");
     button.dataset.defaultLabel = button.textContent;
-    button.textContent = button.dataset.action === "delete-story" ? "Delete story?" : "Delete chapter?";
+    button.textContent =
+      button.dataset.action === "delete-story"
+        ? "Delete story?"
+        : button.dataset.action === "delete-voice"
+          ? `Delete ${button.dataset.defaultLabel || "voice"}?`
+          : "Delete chapter?";
     clearTimeout(confirmResetTimer);
     confirmResetTimer = setTimeout(resetConfirmingButtons, CONFIRM_RESET_MS);
     return;
@@ -302,12 +320,22 @@ async function handleDeleteAction(button) {
   const response =
     button.dataset.action === "delete-story"
       ? await request("LIBRARY_DELETE_STORY", { storyId: button.dataset.storyId })
-      : await request("LIBRARY_DELETE_CHAPTER", { chapterId: button.dataset.chapterId });
+      : button.dataset.action === "delete-voice"
+        ? await request("LIBRARY_DELETE_CHAPTER_VOICE", {
+            chapterId: button.dataset.chapterId,
+            voiceId: button.dataset.voiceId,
+            variantChapterId: button.dataset.variantChapterId
+          })
+        : await request("LIBRARY_DELETE_CHAPTER", { chapterId: button.dataset.chapterId });
 
   if (Array.isArray(response?.stories)) {
     renderLibrary(response, { force: true });
     setLibraryFlash(
-      button.dataset.action === "delete-story" ? "Story removed from this device." : "Chapter removed from this device.",
+      button.dataset.action === "delete-story"
+        ? "Story removed from this device."
+        : button.dataset.action === "delete-voice"
+          ? "Voice variant removed from this device."
+          : "Chapter removed from this device.",
       "success"
     );
   } else {

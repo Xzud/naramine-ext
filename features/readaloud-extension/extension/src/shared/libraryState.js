@@ -4,10 +4,41 @@
 
 const MIN_STORY_TITLE_LENGTH = 3;
 
+function getVoiceVariants(chapter) {
+  return Array.isArray(chapter?.variants) ? chapter.variants.filter(Boolean) : [];
+}
+
+function isVariantDownloaded(variant) {
+  return Boolean(variant) && variant.chunkCount > 0 && variant.readyAudioCount >= variant.chunkCount;
+}
+
+function selectProgressVariant(chapter, activeVoiceId = null) {
+  const variants = getVoiceVariants(chapter);
+  if (!variants.length) {
+    return null;
+  }
+  return (
+    (activeVoiceId ? variants.find((variant) => variant.voiceId === activeVoiceId) : null) ||
+    variants.find((variant) => !isVariantDownloaded(variant)) ||
+    variants[0]
+  );
+}
+
 // downloaded: every chunk has cached audio. processing: the warming pipeline
 // is actively synthesizing this chapter. paused: a partial download that is
 // not being worked on (interrupted warmup, closed tab, failed chunks).
 export function deriveChapterStatus(chapter, warmingChapterIds = new Set()) {
+  const variants = getVoiceVariants(chapter);
+  if (variants.length > 0) {
+    if (variants.every((variant) => isVariantDownloaded(variant))) {
+      return "downloaded";
+    }
+    if (warmingChapterIds.has(chapter.chapterId)) {
+      return "processing";
+    }
+    return "paused";
+  }
+
   if (chapter.chunkCount > 0 && chapter.readyAudioCount >= chapter.chunkCount) {
     return "downloaded";
   }
@@ -45,18 +76,41 @@ export function deriveStoryTitle(titles, storyId) {
 
 export function groupLibraryByStory(
   chapters,
-  { warmingChapterIds = [], activeChapterId = null, storyMetadataById = {}, lastPlayedByStory = {} } = {}
+  {
+    warmingChapterIds = [],
+    activeChapterId = null,
+    storyMetadataById = {},
+    lastPlayedByStory = {},
+    activeVoiceByChapter = {}
+  } = {}
 ) {
   const warmingSet = new Set(warmingChapterIds);
   const byStory = new Map();
 
   for (const chapter of chapters || []) {
     const storyId = chapter.storyId || "unknown-story";
+    const activeVoiceId = activeVoiceByChapter[chapter.chapterId] || null;
+    const progressVariant = selectProgressVariant(chapter, activeVoiceId);
+    const variants = getVoiceVariants(chapter).map((variant) => ({
+      ...variant,
+      isDownloaded: isVariantDownloaded(variant),
+      isActive: Boolean(activeVoiceId) && activeVoiceId === variant.voiceId
+    }));
     if (!byStory.has(storyId)) {
       byStory.set(storyId, []);
     }
     byStory.get(storyId).push({
       ...chapter,
+      variants,
+      activeVoiceId,
+      voiceCount: variants.length,
+      downloadedVoiceCount: variants.filter((variant) => variant.isDownloaded).length,
+      chunkCount: progressVariant?.chunkCount || chapter.chunkCount || 0,
+      readyAudioCount: progressVariant?.readyAudioCount || chapter.readyAudioCount || 0,
+      failedCount: progressVariant?.failedCount || chapter.failedCount || 0,
+      sizeBytes:
+        chapter.sizeBytes ||
+        variants.reduce((total, variant) => total + (variant.sizeBytes || 0), 0),
       status: deriveChapterStatus(chapter, warmingSet),
       isActive: Boolean(activeChapterId) && chapter.chapterId === activeChapterId
     });

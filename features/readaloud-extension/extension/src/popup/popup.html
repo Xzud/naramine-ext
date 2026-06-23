@@ -932,7 +932,7 @@
 
       .chapter {
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         gap: 10px;
         padding: 10px 12px 10px 16px;
         border-top: 1px solid var(--hairline-soft);
@@ -958,9 +958,109 @@
       .chapter-meta {
         display: flex;
         align-items: center;
+        flex-wrap: wrap;
         gap: 8px;
         font-size: 10.5px;
         color: var(--muted);
+      }
+
+      .voice-panel {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 11px 13px 12px;
+        border: 1px solid var(--hairline-soft);
+        border-radius: 16px;
+        background: rgba(18, 22, 31, 0.76);
+      }
+
+      .voice-copy {
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+
+      .voice-label {
+        font-size: 9.5px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      .voice-current {
+        font-size: 12.5px;
+        line-height: 1.35;
+        color: var(--cream);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .voice-select {
+        appearance: none;
+        border: 1px solid var(--hairline);
+        border-radius: 999px;
+        background:
+          linear-gradient(180deg, rgba(240, 180, 94, 0.14), rgba(240, 180, 94, 0.06)),
+          var(--panel);
+        color: var(--cream);
+        font-family: var(--font-ui);
+        font-size: 11.5px;
+        line-height: 1.2;
+        padding: 9px 34px 9px 12px;
+        cursor: pointer;
+        min-width: 148px;
+      }
+
+      .voice-select:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+
+      .voice-pill-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 6px;
+      }
+
+      .voice-pill {
+        border: 1px solid var(--hairline-soft);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.04);
+        color: var(--cream-dim);
+        font-family: var(--font-ui);
+        font-size: 10.5px;
+        font-weight: 600;
+        line-height: 1;
+        padding: 6px 10px;
+        cursor: pointer;
+        transition: border-color 150ms ease, color 150ms ease, background 150ms ease;
+      }
+
+      .voice-pill:hover {
+        border-color: rgba(236, 122, 114, 0.5);
+        color: var(--danger);
+        background: rgba(236, 122, 114, 0.08);
+      }
+
+      .voice-pill.active {
+        border-color: rgba(240, 180, 94, 0.42);
+        color: var(--amber-bright);
+        background: rgba(240, 180, 94, 0.1);
+      }
+
+      .voice-pill.partial {
+        opacity: 0.82;
+      }
+
+      .voice-pill.confirming {
+        border-color: var(--danger);
+        background: var(--danger);
+        color: #2a1010;
       }
 
       .status-badge {
@@ -1123,6 +1223,14 @@
         <button id="syncToggle" class="sync-toggle" hidden aria-pressed="false">
           <span class="sync-dot" aria-hidden="true"></span><span id="syncLabel">Sync off</span>
         </button>
+      </div>
+
+      <div id="voicePanel" class="voice-panel" hidden>
+        <div class="voice-copy">
+          <span class="voice-label">Current voice</span>
+          <span id="voiceCurrent" class="voice-current"></span>
+        </div>
+        <select id="voiceSelect" class="voice-select" aria-label="Switch playback voice"></select>
       </div>
 
       <div class="controls">

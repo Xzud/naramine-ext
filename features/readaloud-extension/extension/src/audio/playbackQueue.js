@@ -19,7 +19,6 @@ import {
   getAudioChunksByChapter,
   getCacheStatus,
   getChapter,
-  getChapterIdsByStory,
   getChunkByIndex,
   getChunksByChapter,
   getLibraryOverview,
@@ -225,24 +224,38 @@ export class PlaybackQueue {
     return (await loadUserSettings(this.storageArea)).defaultVoice;
   }
 
+  buildCacheChapterId(chapterId, voice = null) {
+    if (!chapterId || !voice) {
+      return chapterId;
+    }
+    return `${chapterId}::voice:${voice}`;
+  }
+
+  getSessionCacheChapterId(session = null) {
+    if (!session?.chapterId) {
+      return DEFAULT_CHAPTER_ID;
+    }
+    return session.cacheChapterId || session.chapterId;
+  }
+
   async resolveChapterId(chapterId) {
     return chapterId || (await this.getActiveChapterId());
   }
 
-  async getCacheSnapshot(chapterId) {
-    return getCacheStatus(chapterId);
+  async getCacheSnapshot(chapterId, storedChapterId = null) {
+    return getCacheStatus(storedChapterId || chapterId);
   }
 
-  async getChunkRecord(chapterId, chunkIndex) {
-    return getChunkByIndex(chapterId, chunkIndex);
+  async getChunkRecord(chapterId, chunkIndex, storedChapterId = null) {
+    return getChunkByIndex(storedChapterId || chapterId, chunkIndex);
   }
 
-  async getChapterRecord(chapterId) {
-    return getChapter(chapterId);
+  async getChapterRecord(chapterId, storedChapterId = null) {
+    return getChapter(storedChapterId || chapterId);
   }
 
-  async getChapterChunkRecords(chapterId) {
-    return getChunksByChapter(chapterId);
+  async getChapterChunkRecords(chapterId, storedChapterId = null) {
+    return getChunksByChapter(storedChapterId || chapterId);
   }
 
   async saveChapterRecord(record) {
@@ -253,19 +266,19 @@ export class PlaybackQueue {
     return saveChunks(records);
   }
 
-  async replaceChapterChunkRecords(chapterId, chunkRecords) {
-    return replaceChapterData(chapterId, chunkRecords);
+  async replaceChapterChunkRecords(chapterId, chunkRecords, storedChapterId = null) {
+    return replaceChapterData(storedChapterId || chapterId, chunkRecords);
   }
 
-  async getAudioRecordsForChapter(chapterId) {
-    return getAudioChunksByChapter(chapterId);
+  async getAudioRecordsForChapter(chapterId, storedChapterId = null) {
+    return getAudioChunksByChapter(storedChapterId || chapterId);
   }
 
   // Cached-chunk-ID lookup that skips loading the audio blobs. Used by the
   // warming pipeline's tail scan, which only needs to know which chunks are
   // already cached.
-  async getAudioChunkIdsForChapter(chapterId) {
-    return getAudioChunkIdsByChapter(chapterId);
+  async getAudioChunkIdsForChapter(chapterId, storedChapterId = null) {
+    return getAudioChunkIdsByChapter(storedChapterId || chapterId);
   }
 
   async saveAudioRecord(record) {
@@ -317,6 +330,9 @@ export class PlaybackQueue {
   // become a complete download); playing sessions only warm ahead of the
   // playhead.
   getWarmupFloorIndex(session) {
+    if (session?.fullWarmupRequested) {
+      return -1;
+    }
     if (!session.hasStartedPlayback && !session.playRequested) {
       return -1;
     }
@@ -324,13 +340,14 @@ export class PlaybackQueue {
   }
 
   async hasWarmableChunk(chapterId, session) {
-    return Boolean(await this.findNextChunkToWarm(chapterId, this.getWarmupFloorIndex(session)));
+    return Boolean(await this.findNextChunkToWarm(chapterId, this.getWarmupFloorIndex(session), session));
   }
 
-  async findNextChunkToWarm(chapterId, fromChunkIndex) {
+  async findNextChunkToWarm(chapterId, fromChunkIndex, session = null) {
+    const storedChapterId = session ? this.getSessionCacheChapterId(session) : chapterId;
     const [chunks, cachedIds] = await Promise.all([
-      this.getChapterChunkRecords(chapterId),
-      this.getAudioChunkIdsForChapter(chapterId)
+      this.getChapterChunkRecords(chapterId, storedChapterId),
+      this.getAudioChunkIdsForChapter(chapterId, storedChapterId)
     ]);
     const cachedChunkIds = new Set(cachedIds);
     return (
@@ -425,7 +442,7 @@ export class PlaybackQueue {
         return "completed";
       }
 
-      const chunk = await this.findNextChunkToWarm(chapterId, this.getWarmupFloorIndex(session));
+      const chunk = await this.findNextChunkToWarm(chapterId, this.getWarmupFloorIndex(session), session);
       if (!chunk || attemptedChunkIds.has(chunk.chunkId)) {
         return "completed";
       }
@@ -444,8 +461,9 @@ export class PlaybackQueue {
         const blob = await this.fetchAudioForChunk(session, chunk, { signal: controller.signal });
         await this.saveAudioRecord({
           chunkId: chunk.chunkId,
-          chapterId,
+          chapterId: this.getSessionCacheChapterId(session),
           chunkIndex: chunk.chunkIndex,
+          voice: session.voice || DEFAULT_VOICE,
           blob,
           mimeType: blob?.type || "audio/wav",
           createdAt: Date.now()
@@ -521,7 +539,11 @@ export class PlaybackQueue {
       return { ok: false, error: "missing_page_target" };
     }
 
-    const chunk = await this.getChunkRecord(session.chapterId, session.currentChunkIndex);
+    const chunk = await this.getChunkRecord(
+      session.chapterId,
+      session.currentChunkIndex,
+      this.getSessionCacheChapterId(session)
+    );
     if (!chunk || chunk.chunkId !== chunkId) {
       return { ok: false, error: "chunk_not_found" };
     }
@@ -539,12 +561,16 @@ export class PlaybackQueue {
     });
   }
 
-  async findChunkForParagraph(chapterId, paragraphId) {
+  async findChunkForParagraph(chapterId, paragraphId, session = null) {
     if (!chapterId || !paragraphId) {
       return null;
     }
 
-    const chunkRecords = await this.getChapterChunkRecords(chapterId);
+    const chapterSession = session || (await this.loadSession(chapterId).catch(() => null));
+    const chunkRecords = await this.getChapterChunkRecords(
+      chapterId,
+      chapterSession ? this.getSessionCacheChapterId(chapterSession) : null
+    );
     return (
       chunkRecords.find((chunk) => {
         const paragraphIds = Array.isArray(chunk.paragraphIds) ? chunk.paragraphIds.filter(Boolean) : [];
@@ -592,9 +618,12 @@ export class PlaybackQueue {
   }
 
   async mergeChapterChunkData(session, chapter, chunks, existingChunks) {
+    const cacheChapterId = this.getSessionCacheChapterId(session);
     const chapterRecord = {
-      chapterId: session.chapterId,
+      chapterId: cacheChapterId,
+      sourceChapterId: session.chapterId,
       storyId: session.storyId,
+      voice: session.voice || DEFAULT_VOICE,
       title: session.title || "Wattpad Chapter",
       sourceUrl: session.sourceUrl || "",
       textHash: stableHash(session.text),
@@ -611,7 +640,11 @@ export class PlaybackQueue {
       existingChunks.every((existingChunk, index) => this.chunkMatchesExistingRecord(existingChunk, chunks[index]));
 
     if (!canPreserveExistingChunks) {
-      await this.replaceChapterChunkRecords(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
+      await this.replaceChapterChunkRecords(
+        session.chapterId,
+        chunks.map((chunk) => ({ ...chunk, status: "pending" })),
+        cacheChapterId
+      );
       return;
     }
 
@@ -706,17 +739,26 @@ export class PlaybackQueue {
       nextPartId: response.nextPart?.partId || latestSession.nextPartId || null,
       nextPartUrl: response.nextPart?.url || latestSession.nextPartUrl || null,
       nextPartTitle: response.nextPart?.title || latestSession.nextPartTitle || null,
-      playRequested: Boolean(latestSession.playRequested)
+      playRequested: Boolean(latestSession.playRequested),
+      cacheChapterId:
+        latestSession.cacheChapterId ||
+        this.buildCacheChapterId(latestSession.chapterId, latestSession.voice || DEFAULT_VOICE)
     };
 
-    const chapter = await this.getChapterRecord(refreshedSession.chapterId);
+    const chapter = await this.getChapterRecord(
+      refreshedSession.chapterId,
+      this.getSessionCacheChapterId(refreshedSession)
+    );
     const chunks = chunkText(refreshedSession.text, {
       storyId: refreshedSession.storyId,
-      chapterId: refreshedSession.chapterId,
+      chapterId: this.getSessionCacheChapterId(refreshedSession),
       paragraphs: refreshedSession.paragraphs || []
     });
     refreshedSession.totalChunks = chunks.length;
-    const existingChunks = await this.getChapterChunkRecords(refreshedSession.chapterId);
+    const existingChunks = await this.getChapterChunkRecords(
+      refreshedSession.chapterId,
+      this.getSessionCacheChapterId(refreshedSession)
+    );
 
     await this.mergeChapterChunkData(refreshedSession, chapter, chunks, existingChunks);
     await this.saveSession(refreshedSession);
@@ -792,7 +834,12 @@ export class PlaybackQueue {
 
     return this.runPrefetchExclusive(async () => {
       const record = await this.loadPrefetchRecord();
-      if (record && record.fromChapterId === session.chapterId && record.url === session.nextPartUrl) {
+      if (
+        record &&
+        record.fromChapterId === session.chapterId &&
+        record.url === session.nextPartUrl &&
+        (record.voice || null) === (session.voice || null)
+      ) {
         if (record.status === "failed") {
           return false;
         }
@@ -807,6 +854,7 @@ export class PlaybackQueue {
         fromTabId: typeof session.tabId === "number" ? session.tabId : null,
         nextChapterId: session.nextPartId || null,
         url: session.nextPartUrl,
+        voice: session.voice || null,
         tabId: tab?.id ?? null,
         status: "opening",
         playOnReady,
@@ -914,7 +962,11 @@ export class PlaybackQueue {
 
   async warmupPrefetchedChapter(record, extraction) {
     return this.runExclusive(async () => {
-      const playbackInput = await this.resolvePlaybackInput({ ...extraction, tabId: record.tabId });
+      const playbackInput = await this.resolvePlaybackInput({
+        ...extraction,
+        voice: record.voice || extraction.voice || null,
+        tabId: record.tabId
+      });
       if (!playbackInput.ok) {
         return null;
       }
@@ -922,7 +974,10 @@ export class PlaybackQueue {
       const chapterId = playbackInput.chapterId;
       const existingSession = await this.loadSession(chapterId);
       const session =
-        existingSession && existingSession.text === playbackInput.text && existingSession.state !== "error"
+        existingSession &&
+        existingSession.text === playbackInput.text &&
+        existingSession.state !== "error" &&
+        existingSession.voice === playbackInput.voice
           ? { ...existingSession, tabId: record.tabId }
           : this.createSessionFromInput(playbackInput, {
               playRequested: false,
@@ -1154,7 +1209,8 @@ export class PlaybackQueue {
           url: step.url,
           partId: step.partId,
           chainNext: step.chainNext,
-          activateOnReady: step.activateOnReady
+          activateOnReady: step.activateOnReady,
+          voice: context.voice || null
         });
       } else if (step.action === "prefetch-next") {
         const session = await this.loadSession(context.partId);
@@ -1208,7 +1264,7 @@ export class PlaybackQueue {
   // Sync on mid-novel also gets the beginning. Single slot: only chapter 1
   // is ever backfilled, and re-triggering while one runs is a no-op. Shares
   // the prefetch lock because both records are low-traffic tab lifecycles.
-  async openSyncBackfill({ storyId, url, partId = null, chainNext = false, activateOnReady = false }) {
+  async openSyncBackfill({ storyId, url, partId = null, chainNext = false, activateOnReady = false, voice = null }) {
     if (!url || typeof this.tabsApi?.create !== "function") {
       return false;
     }
@@ -1227,6 +1283,7 @@ export class PlaybackQueue {
         storyId: storyId || null,
         url,
         partId,
+        voice,
         tabId: tab?.id ?? null,
         status: "opening",
         chainNext,
@@ -1404,6 +1461,7 @@ export class PlaybackQueue {
       chapterId: session.chapterId,
       chapterTitle: session.title || "",
       partUrl: session.sourceUrl || "",
+      voice: session.voice || null,
       chunkIndex: typeof session.currentChunkIndex === "number" ? session.currentChunkIndex : 0,
       chunkOffsetMs,
       chapterOffsetMs,
@@ -1433,6 +1491,7 @@ export class PlaybackQueue {
       chapterId: record.chapterId || null,
       chapterTitle: record.chapterTitle || record.title || "",
       partUrl: record.partUrl || record.sourceUrl || "",
+      voice: record.voice || null,
       chunkIndex: typeof record.chunkIndex === "number" ? record.chunkIndex : 0,
       chunkOffsetMs: Math.max(0, Math.round(record.chunkOffsetMs || 0)),
       chapterOffsetMs: Math.max(
@@ -1455,6 +1514,7 @@ export class PlaybackQueue {
       chapterId: session.chapterId,
       chapterTitle: session.title || "",
       partUrl: session.sourceUrl || "",
+      voice: session.voice || null,
       chunkIndex: typeof session.currentChunkIndex === "number" ? session.currentChunkIndex : 0,
       chunkOffsetMs: session.currentChunkOffsetMs || 0,
       chapterOffsetMs: this.getSessionChapterOffsetMs(session, now),
@@ -1510,6 +1570,8 @@ export class PlaybackQueue {
 
     return {
       ...session,
+      voice: record.voice || session.voice || DEFAULT_VOICE,
+      cacheChapterId: this.buildCacheChapterId(session.chapterId, record.voice || session.voice || DEFAULT_VOICE),
       currentChunkIndex: Math.max(0, Math.round(record.chunkIndex || 0)),
       currentChunkId: null,
       currentChunkOffsetMs: chunkOffsetMs,
@@ -1602,6 +1664,7 @@ export class PlaybackQueue {
       await this.activateResumedChapter({
         chapterId: resumeRecord.chapterId,
         tabId: existing.tabId,
+        voice: resumeRecord.voice || existing.voice || null,
         chunkIndex: resumeRecord.chunkIndex || 0,
         chunkOffsetMs: resumeRecord.chunkOffsetMs || 0,
         chapterOffsetMs: resumeRecord.chapterOffsetMs || 0,
@@ -1655,6 +1718,7 @@ export class PlaybackQueue {
         storyId: lastPlayed.storyId || null,
         chapterId: lastPlayed.chapterId || null,
         url: lastPlayed.partUrl,
+        voice: lastPlayed.voice || null,
         chunkIndex: lastPlayed.chunkIndex || 0,
         chunkOffsetMs: Math.max(0, Math.round(lastPlayed.chunkOffsetMs || 0)),
         chapterOffsetMs: Math.max(
@@ -1725,6 +1789,7 @@ export class PlaybackQueue {
     await this.activateResumedChapter({
       chapterId,
       tabId: record.tabId,
+      voice: record.voice || null,
       chunkIndex: record.chunkIndex || 0,
       chunkOffsetMs: record.chunkOffsetMs || 0,
       chapterOffsetMs: record.chapterOffsetMs || 0
@@ -1737,6 +1802,7 @@ export class PlaybackQueue {
   async activateResumedChapter({
     chapterId,
     tabId = null,
+    voice = null,
     chunkIndex = 0,
     chunkOffsetMs = 0,
     chapterOffsetMs = 0,
@@ -1754,13 +1820,22 @@ export class PlaybackQueue {
       if (!session?.text || session.state === "error") {
         return false;
       }
-      const maxIndex = Math.max(0, (session.totalChunks || 1) - 1);
+      const resumedBaseSession =
+        voice && voice !== session.voice
+          ? {
+              ...session,
+              voice,
+              cacheChapterId: this.buildCacheChapterId(chapterId, voice)
+            }
+          : session;
+      await this.ensureChapterData(resumedBaseSession);
+      const maxIndex = Math.max(0, (resumedBaseSession.totalChunks || 1) - 1);
       const targetIndex = Math.min(Math.max(0, chunkIndex), maxIndex);
       const targetChunkOffsetMs = Math.max(0, Math.round(chunkOffsetMs || 0));
       const targetChapterOffsetMs = Math.max(targetChunkOffsetMs, Math.round(chapterOffsetMs || 0));
       const startedSession = {
-        ...session,
-        tabId: typeof tabId === "number" ? tabId : session.tabId || null,
+        ...resumedBaseSession,
+        tabId: typeof tabId === "number" ? tabId : resumedBaseSession.tabId || null,
         paused: false,
         stopped: false,
         playRequested: true,
@@ -1925,8 +2000,17 @@ export class PlaybackQueue {
     return getLibraryOverview();
   }
 
-  async getChapterIdsForStory(storyId) {
-    return getChapterIdsByStory(storyId);
+  async getLibraryChapterRecord(chapterId) {
+    if (!chapterId) {
+      return null;
+    }
+    return (await this.getLibraryOverviewRecords()).find((chapter) => chapter.chapterId === chapterId) || null;
+  }
+
+  async getLibraryChapterIdsForStory(storyId) {
+    return (await this.getLibraryOverviewRecords())
+      .filter((chapter) => chapter.storyId === storyId)
+      .map((chapter) => chapter.chapterId);
   }
 
   async getLibrary() {
@@ -1936,6 +2020,7 @@ export class PlaybackQueue {
       this.getStoryMetadataRecords().catch(() => []),
       this.loadLastPlayed().catch(() => ({}))
     ]);
+    const activeSession = activeChapterId ? await this.loadSession(activeChapterId).catch(() => null) : null;
     return {
       ok: true,
       stories: groupLibraryByStory(overview, {
@@ -1943,7 +2028,11 @@ export class PlaybackQueue {
         warmingChapterIds: [...this.activeWarmups.keys(), ...this.pendingWarmups],
         activeChapterId,
         storyMetadataById: Object.fromEntries((storyMetadata || []).map((record) => [record.storyId, record])),
-        lastPlayedByStory
+        lastPlayedByStory,
+        activeVoiceByChapter:
+          activeSession?.chapterId && activeSession.voice
+            ? { [activeSession.chapterId]: activeSession.voice }
+            : {}
       })
     };
   }
@@ -1963,19 +2052,56 @@ export class PlaybackQueue {
     this.pendingWarmups.delete(chapterId);
     this.warmupFetchControllers.get(chapterId)?.abort();
 
-    const [session, activeChapterId] = await Promise.all([this.loadSession(chapterId), this.getActiveChapterId()]);
+    const [session, activeChapterId, chapter] = await Promise.all([
+      this.loadSession(chapterId),
+      this.getActiveChapterId(),
+      this.getLibraryChapterRecord(chapterId).catch(() => null)
+    ]);
     if (session && !session.stopped && chapterId === activeChapterId) {
       await this.stopOffscreenPlayback();
     }
     await this.deleteSession(chapterId).catch(() => {});
-    await this.deleteChapterRecords(chapterId);
+    const variantChapterIds = Array.isArray(chapter?.variants)
+      ? chapter.variants.map((variant) => variant.variantChapterId).filter(Boolean)
+      : [chapterId];
+    for (const variantChapterId of variantChapterIds) {
+      await this.deleteChapterRecords(variantChapterId);
+    }
     this.log("downloaded_chapter_deleted", {}, { chapterId });
+  }
+
+  async deleteDownloadedChapterVoice(payload = {}) {
+    await this.runExclusive(() => this.deleteDownloadedChapterVoiceExclusive(payload));
+    return this.getLibrary();
+  }
+
+  async deleteDownloadedChapterVoiceExclusive(payload = {}) {
+    const chapterId = payload.chapterId || null;
+    const variantChapterId =
+      payload.variantChapterId || this.buildCacheChapterId(chapterId, payload.voiceId || null) || chapterId;
+    if (!chapterId || !variantChapterId) {
+      return;
+    }
+
+    const [session, activeChapterId] = await Promise.all([this.loadSession(chapterId), this.getActiveChapterId()]);
+    const activeCacheChapterId = this.getSessionCacheChapterId(session);
+    if (session && !session.stopped && chapterId === activeChapterId && activeCacheChapterId === variantChapterId) {
+      await this.stopOffscreenPlayback();
+      await this.deleteSession(chapterId).catch(() => {});
+    }
+
+    await this.deleteChapterRecords(variantChapterId);
+    this.log("downloaded_chapter_voice_deleted", {}, {
+      chapterId,
+      variantChapterId,
+      voiceId: payload.voiceId || null
+    });
   }
 
   async deleteDownloadedStory(storyId) {
     if (storyId) {
       await this.runExclusive(async () => {
-        const chapterIds = await this.getChapterIdsForStory(storyId);
+        const chapterIds = await this.getLibraryChapterIdsForStory(storyId);
         for (const chapterId of chapterIds) {
           await this.deleteDownloadedChapterExclusive(chapterId);
         }
@@ -2049,7 +2175,7 @@ export class PlaybackQueue {
 
     await this.ensureChapterData(preparedSession);
 
-    let targetChunk = await this.findChunkForParagraph(chapterId, clickedParagraphId);
+    let targetChunk = await this.findChunkForParagraph(chapterId, clickedParagraphId, preparedSession);
     if (!targetChunk) {
       await this.refreshChapterDataFromPage(
         {
@@ -2059,7 +2185,7 @@ export class PlaybackQueue {
         { alreadyExclusive: true }
       ).catch(() => {});
       await this.ensureChapterData(preparedSession);
-      targetChunk = await this.findChunkForParagraph(chapterId, clickedParagraphId);
+      targetChunk = await this.findChunkForParagraph(chapterId, clickedParagraphId, preparedSession);
     }
 
     if (!targetChunk) {
@@ -2181,7 +2307,11 @@ export class PlaybackQueue {
       return false;
     }
 
-    const chunk = await this.getChunkRecord(chapterId, session.currentChunkIndex + offset);
+    const chunk = await this.getChunkRecord(
+      chapterId,
+      session.currentChunkIndex + offset,
+      this.getSessionCacheChapterId(session)
+    );
     if (!chunk) {
       return false;
     }
@@ -2216,10 +2346,11 @@ export class PlaybackQueue {
 
   async getState(chapterId = null) {
     const resolvedChapterId = await this.resolveChapterId(chapterId);
-    const [session, cache] = await Promise.all([
-      this.loadSession(resolvedChapterId),
-      this.getCacheSnapshot(resolvedChapterId)
-    ]);
+    const session = await this.loadSession(resolvedChapterId);
+    const cache = await this.getCacheSnapshot(
+      resolvedChapterId,
+      session ? this.getSessionCacheChapterId(session) : null
+    );
 
     if (!session) {
       return createIdleRuntimeState(resolvedChapterId, cache);
@@ -2230,25 +2361,29 @@ export class PlaybackQueue {
 
   async buildRequestFailureState(chapterId = null, error, lastEvent = "request_failed") {
     const resolvedChapterId = await this.resolveChapterId(chapterId);
+    const session = await this.loadSession(resolvedChapterId);
     const cache = await this.getCacheSnapshot(resolvedChapterId).catch(() => ({
       chunkCount: 0,
       readyAudioCount: 0,
       failedCount: 0,
       cacheType: "temporary"
     }));
-    const session = await this.loadSession(resolvedChapterId);
+    const resolvedCache =
+      session && this.getSessionCacheChapterId(session) !== resolvedChapterId
+        ? await this.getCacheSnapshot(resolvedChapterId, this.getSessionCacheChapterId(session)).catch(() => cache)
+        : cache;
 
     if (!session) {
       return createRuntimeState({
         chapterId: resolvedChapterId,
         state: "error",
         playbackStatus: "error",
-        totalChunks: cache.chunkCount || 0,
-        readyAudioCount: cache.readyAudioCount || 0,
-        chapterReadyAudioCount: cache.readyAudioCount || 0,
-        failedCount: cache.failedCount || 0,
-        cacheType: cache.cacheType || "temporary",
-        generatedCount: cache.readyAudioCount || 0,
+        totalChunks: resolvedCache.chunkCount || 0,
+        readyAudioCount: resolvedCache.readyAudioCount || 0,
+        chapterReadyAudioCount: resolvedCache.readyAudioCount || 0,
+        failedCount: resolvedCache.failedCount || 0,
+        cacheType: resolvedCache.cacheType || "temporary",
+        generatedCount: resolvedCache.readyAudioCount || 0,
         lastEvent,
         errorMessage: String(error),
         stateAvailable: true
@@ -2264,15 +2399,17 @@ export class PlaybackQueue {
       errorMessage: String(error)
     };
     await this.saveSession(failedSession);
-    return mapSessionToRuntimeState(failedSession, cache);
+    return mapSessionToRuntimeState(failedSession, resolvedCache);
   }
 
   createSessionFromInput(playbackInput, overrides = {}) {
     const chapterId = playbackInput.chapterId;
+    const voice = playbackInput.voice || DEFAULT_VOICE;
     return {
       chapterId,
       storyId: playbackInput.storyId || DEFAULT_STORY_ID,
-      voice: playbackInput.voice || DEFAULT_VOICE,
+      voice,
+      cacheChapterId: this.buildCacheChapterId(chapterId, voice),
       providerMode: playbackInput.providerMode || DEFAULT_PROVIDER_MODE,
       tabId: playbackInput.tabId || null,
       text: playbackInput.text,
@@ -2689,17 +2826,91 @@ export class PlaybackQueue {
     return this.getState(resolvedChapterId);
   }
 
+  async switchVoice(payload = {}) {
+    return this.runExclusive(() => this.switchVoiceExclusive(payload));
+  }
+
+  async switchVoiceExclusive(payload = {}) {
+    const resolvedChapterId = await this.resolveChapterId(payload.chapterId || null);
+    const nextVoice = payload.voiceId || payload.voice || null;
+    if (!nextVoice) {
+      return this.buildRequestFailureState(resolvedChapterId, "No voice was selected.", "voice_switch_missing");
+    }
+
+    const session = await this.loadSession(resolvedChapterId);
+    if (!session?.text || session.state === "error") {
+      return this.buildRequestFailureState(
+        resolvedChapterId,
+        "Open or play a cached chapter before switching voices.",
+        "voice_switch_missing_session"
+      );
+    }
+
+    if (session.voice === nextVoice) {
+      return this.getState(resolvedChapterId);
+    }
+
+    const playbackStatus = await this.queryOffscreenPlaybackStatus();
+    const currentChunkOffsetMs = this.getChunkOffsetFromPlaybackStatus(session, playbackStatus);
+    const foldedSession = this.foldPlaybackClock({
+      ...session,
+      currentChunkOffsetMs
+    });
+    const shouldResumePlayback = Boolean(
+      session.playRequested && !session.paused && !session.stopped && session.state !== "ended"
+    );
+
+    await this.stopOffscreenPlayback();
+    this.interruptWarmupFetches();
+
+    const nextSession = {
+      ...foldedSession,
+      voice: nextVoice,
+      cacheChapterId: this.buildCacheChapterId(resolvedChapterId, nextVoice),
+      currentChunkId: null,
+      currentChunkOffsetMs,
+      playbackAttemptId: null,
+      paused: !shouldResumePlayback && session.state === "paused",
+      stopped: false,
+      playRequested: shouldResumePlayback,
+      state: shouldResumePlayback ? "playback_starting" : session.state === "paused" ? "paused" : "startup_ready",
+      playbackStatus: shouldResumePlayback ? "idle" : session.state === "paused" ? "paused" : "idle",
+      streamStatus: shouldResumePlayback ? "idle" : session.state === "paused" ? "paused" : "idle",
+      playbackResumedAt: null,
+      errorMessage: null,
+      playBlockedOffPage: false,
+      fullWarmupRequested: true,
+      lastEvent: "voice_switched"
+    };
+
+    await this.ensureChapterData(nextSession);
+    await this.saveSession(nextSession);
+    await this.recordLastPlayed(nextSession).catch(() => {});
+
+    if (shouldResumePlayback) {
+      await this.ensureOffscreenDocument();
+      await this.processSession(resolvedChapterId);
+    } else {
+      void this.ensureWarmingPipeline(resolvedChapterId);
+    }
+
+    return this.getState(resolvedChapterId);
+  }
+
   async ensureChapterData(session) {
+    session.cacheChapterId =
+      session.cacheChapterId || this.buildCacheChapterId(session.chapterId, session.voice || DEFAULT_VOICE);
+    const cacheChapterId = this.getSessionCacheChapterId(session);
     const chapterHash = stableHash(session.text);
-    const chapter = await this.getChapterRecord(session.chapterId);
+    const chapter = await this.getChapterRecord(session.chapterId, cacheChapterId);
     const chunks = chunkText(session.text, {
       storyId: session.storyId,
-      chapterId: session.chapterId,
+      chapterId: cacheChapterId,
       paragraphs: session.paragraphs || []
     });
     session.totalChunks = chunks.length;
 
-    const existing = await this.getChapterChunkRecords(session.chapterId);
+    const existing = await this.getChapterChunkRecords(session.chapterId, cacheChapterId);
 
     if (!chapter || chapter.textHash !== chapterHash) {
       await this.mergeChapterChunkData(session, chapter, chunks, existing);
@@ -2707,10 +2918,18 @@ export class PlaybackQueue {
     }
 
     if (!existing.length) {
-      await this.replaceChapterChunkRecords(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
+      await this.replaceChapterChunkRecords(
+        session.chapterId,
+        chunks.map((chunk) => ({ ...chunk, status: "pending" })),
+        cacheChapterId
+      );
     } else {
       if (existing.some((chunk, index) => !this.chunkMatchesExistingRecord(chunk, chunks[index]))) {
-        await this.replaceChapterChunkRecords(session.chapterId, chunks.map((chunk) => ({ ...chunk, status: "pending" })));
+        await this.replaceChapterChunkRecords(
+          session.chapterId,
+          chunks.map((chunk) => ({ ...chunk, status: "pending" })),
+          cacheChapterId
+        );
         return;
       }
 
@@ -2799,7 +3018,11 @@ export class PlaybackQueue {
       return false;
     }
 
-    const chunk = await this.getChunkRecord(chapterId, session.currentChunkIndex);
+    const chunk = await this.getChunkRecord(
+      chapterId,
+      session.currentChunkIndex,
+      this.getSessionCacheChapterId(session)
+    );
     if (!chunk) {
       return false;
     }
@@ -2979,7 +3202,11 @@ export class PlaybackQueue {
 
     if (message.type === "STREAM_PREPARE_READY") {
       if (typeof session.currentChunkIndex === "number") {
-        const nextChunk = await this.getChunkRecord(chapterId, session.currentChunkIndex + 1);
+        const nextChunk = await this.getChunkRecord(
+          chapterId,
+          session.currentChunkIndex + 1,
+          this.getSessionCacheChapterId(session)
+        );
         if (nextChunk?.chunkId === message.chunkId && STREAM_LOOKAHEAD_DEPTH > 1) {
           await this.prefetchChunkAtOffset(chapterId, session, 2);
         }
@@ -3288,6 +3515,7 @@ export class PlaybackQueue {
       chapterId,
       storyId: input.storyId || DEFAULT_STORY_ID,
       voice: defaultVoice,
+      cacheChapterId: this.buildCacheChapterId(chapterId, defaultVoice),
       providerMode: DEFAULT_PROVIDER_MODE,
       tabId: input.tabId || null,
       text: "",

@@ -265,25 +265,28 @@ class LazyLoadPlaybackQueue extends TestPlaybackQueue {
     return PlaybackQueue.prototype.ensureChapterData.call(this, session);
   }
 
-  async getChunkRecord(chapterId, chunkIndex) {
+  async getChunkRecord(chapterId, chunkIndex, storedChapterId = null) {
+    const targetChapterId = storedChapterId || chapterId;
     const record = this.chunkStore.find(
-      (chunk) => chunk.chapterId === chapterId && chunk.chunkIndex === chunkIndex
+      (chunk) => chunk.chapterId === targetChapterId && chunk.chunkIndex === chunkIndex
     );
 
     return record || null;
   }
 
-  async getChapterRecord(chapterId) {
-    if (this.chapterRecord?.chapterId !== chapterId) {
+  async getChapterRecord(chapterId, storedChapterId = null) {
+    const targetChapterId = storedChapterId || chapterId;
+    if (this.chapterRecord?.chapterId !== targetChapterId) {
       return null;
     }
 
     return this.chapterRecord;
   }
 
-  async getChapterChunkRecords(chapterId) {
+  async getChapterChunkRecords(chapterId, storedChapterId = null) {
+    const targetChapterId = storedChapterId || chapterId;
     return this.chunkStore
-      .filter((chunk) => chunk.chapterId === chapterId)
+      .filter((chunk) => chunk.chapterId === targetChapterId)
       .sort((left, right) => left.chunkIndex - right.chunkIndex);
   }
 
@@ -307,9 +310,10 @@ class LazyLoadPlaybackQueue extends TestPlaybackQueue {
     this.chunkStore.sort((left, right) => left.chunkIndex - right.chunkIndex);
   }
 
-  async replaceChapterChunkRecords(chapterId, chunkRecords) {
+  async replaceChapterChunkRecords(chapterId, chunkRecords, storedChapterId = null) {
+    const targetChapterId = storedChapterId || chapterId;
     this.chunkStore = chunkRecords
-      .filter((record) => record.chapterId === chapterId)
+      .filter((record) => record.chapterId === targetChapterId)
       .map((record) => ({ ...record }));
   }
 }
@@ -1308,7 +1312,10 @@ test("near-end playback refreshes lazy-loaded chunks without dropping the active
 
   assert.equal(queue.tabMessages.some((entry) => entry.message.type === "READALOUD_EXTRACT_TEXT"), true);
   assert.equal(queue.chunkStore.length, refreshed.chunks.length);
-  assert.deepEqual(queue.chunkStore.slice(0, initial.chunks.length).map((chunk) => chunk.chunkId), initial.chunks.map((chunk) => chunk.chunkId));
+  assert.deepEqual(
+    queue.chunkStore.slice(0, initial.chunks.length).map((chunk) => chunk.paragraphIds),
+    initial.chunks.map((chunk) => chunk.paragraphIds)
+  );
   assert.equal(session.totalChunks, refreshed.chunks.length);
   assert.equal(session.currentChunkId, initial.chunks[16].chunkId);
   assert.deepEqual(
@@ -1573,7 +1580,10 @@ test("clicking a paragraph starts playback from the matching chunk and highlight
   assert.equal(queue.sentMessages.some((message) => message.type === "STOP_PLAYBACK"), true);
   assert.equal(queue.startedStreams.at(-1), "chapter-click");
   assert.equal(state.currentChunkIndex, 5);
-  assert.equal(state.currentChunkId, chapter.chunks[5].chunkId);
+  assert.equal(
+    state.currentChunkId,
+    queue.chunkStore.find((chunk) => chunk.chunkIndex === 5)?.chunkId || null
+  );
   assert.equal(queue.tabMessages.at(-1).message.type, "READALOUD_SET_ACTIVE_CHUNK");
   assert.deepEqual(queue.tabMessages.at(-1).message.payload.paragraphIds, chapter.chunks[5].paragraphIds);
 });
@@ -1623,9 +1633,12 @@ test("clicking an unknown paragraph fails without starting playback", async () =
 });
 
 function buildPlayingSession(chapterId, overrides = {}) {
+  const voice = overrides.voice || "af_heart";
   return {
     chapterId,
     storyId: `story-${chapterId}`,
+    voice,
+    cacheChapterId: overrides.cacheChapterId || chapterId,
     title: "Race Chapter",
     partId: chapterId,
     extractionStrategy: "dom-paragraphs",
@@ -1853,15 +1866,17 @@ class WarmingPlaybackQueue extends LazyLoadPlaybackQueue {
     this.audioRecordLoads = 0;
   }
 
-  async getAudioRecordsForChapter(chapterId) {
+  async getAudioRecordsForChapter(chapterId, storedChapterId = null) {
+    const targetChapterId = storedChapterId || chapterId;
     this.audioRecordLoads += 1;
-    return this.audioStore.filter((record) => record.chapterId === chapterId);
+    return this.audioStore.filter((record) => record.chapterId === targetChapterId);
   }
 
   // Key-only lookup backed directly by the in-memory store, independent of the
   // blob-loading getAudioRecordsForChapter, so warming never deserializes blobs.
-  async getAudioChunkIdsForChapter(chapterId) {
-    return this.audioStore.filter((record) => record.chapterId === chapterId).map((record) => record.chunkId);
+  async getAudioChunkIdsForChapter(chapterId, storedChapterId = null) {
+    const targetChapterId = storedChapterId || chapterId;
+    return this.audioStore.filter((record) => record.chapterId === targetChapterId).map((record) => record.chunkId);
   }
 
   async saveAudioRecord(record) {
@@ -2850,9 +2865,12 @@ test("deleting a story turns its sync off and drops its metadata", async () => {
 });
 
 function buildWarmSession(chapterId, overrides = {}) {
+  const voice = overrides.voice || "af_heart";
   return {
     chapterId,
     storyId: `story-${chapterId}`,
+    voice,
+    cacheChapterId: overrides.cacheChapterId || chapterId,
     title: "Off Page Chapter",
     partId: chapterId,
     extractionStrategy: "dom-paragraphs",
@@ -3335,6 +3353,88 @@ test("pause persists the current in-chunk cursor for later resume", async () => 
   const record = await queue.getLastPlayed("story-pause");
   assert.equal(record.chunkOffsetMs, 8450);
   assert.ok(record.chapterOffsetMs >= 32000);
+});
+
+test("switchVoice keeps the current cursor and starts a new cache variant", async () => {
+  const queue = new DispatchingPlaybackQueue({
+    runtimeStatus: {
+      playing: true,
+      paused: false,
+      chunkId: "chapter-voice:1:h2",
+      ended: false,
+      error: null,
+      streamStatus: "playing",
+      bytesReceived: 1200,
+      bufferedSegmentCount: 0,
+      bufferedAudioMs: 600,
+      playedAudioMs: 4200,
+      slots: []
+    }
+  });
+  await queue.setActiveChapterId("chapter-voice");
+  await queue.saveSession(
+    buildPlayingSession("chapter-voice", {
+      storyId: "story-voice",
+      voice: "af_heart",
+      currentChunkIndex: 1,
+      currentChunkId: "chapter-voice:1:h2",
+      currentChunkOffsetMs: 1200,
+      playbackElapsedMs: 28000,
+      playbackResumedAt: null
+    })
+  );
+
+  const state = await queue.switchVoice({ voiceId: "bm_lewis" });
+
+  const session = await queue.loadSession("chapter-voice");
+  assert.equal(state.voice, "bm_lewis");
+  assert.equal(session.voice, "bm_lewis");
+  assert.equal(session.cacheChapterId, "chapter-voice::voice:bm_lewis");
+  assert.equal(session.currentChunkIndex, 1);
+  assert.equal(session.currentChunkOffsetMs, 4200);
+  assert.equal(session.playRequested, true);
+  assert.equal(session.fullWarmupRequested, true);
+  assert.deepEqual(queue.startedStreams, ["chapter-voice"]);
+});
+
+test("deleteDownloadedChapterVoice removes only the targeted cached voice variant", async () => {
+  const queue = new TestPlaybackQueue();
+  queue.getLibraryOverviewRecords = async () => [
+    {
+      chapterId: "chapter-variant",
+      storyId: "story-variant",
+      title: "Variant Chapter",
+      sourceUrl: "https://www.wattpad.com/chapter-variant",
+      createdAt: 10,
+      sizeBytes: 4096,
+      variants: [
+        {
+          variantChapterId: "chapter-variant::voice:af_heart",
+          voiceId: "af_heart",
+          chunkCount: 3,
+          readyAudioCount: 3,
+          failedCount: 0,
+          sizeBytes: 2048
+        },
+        {
+          variantChapterId: "chapter-variant::voice:bm_lewis",
+          voiceId: "bm_lewis",
+          chunkCount: 3,
+          readyAudioCount: 3,
+          failedCount: 0,
+          sizeBytes: 2048
+        }
+      ]
+    }
+  ];
+
+  await queue.deleteDownloadedChapterVoice({
+    chapterId: "chapter-variant",
+    voiceId: "bm_lewis",
+    variantChapterId: "chapter-variant::voice:bm_lewis"
+  });
+
+  assert.deepEqual(queue.deletedChapterRecords, ["chapter-variant::voice:bm_lewis"]);
 });
 
 test("continue opens the chapter page and resumes from the saved position", async () => {

@@ -39,12 +39,16 @@ async function handleScopedRequest(message, sender) {
       return queue.pause(message.payload?.chapterId || null);
     case "STOP":
       return queue.stop(message.payload?.chapterId || null);
+    case "PLAYBACK_SET_VOICE":
+      return queue.switchVoice(message.payload || {});
     case "GET_STATE":
       return queue.getState(message.payload?.chapterId || null);
     case "LIBRARY_GET":
       return queue.getLibrary();
     case "LIBRARY_DELETE_CHAPTER":
       return queue.deleteDownloadedChapter(message.payload?.chapterId || null);
+    case "LIBRARY_DELETE_CHAPTER_VOICE":
+      return queue.deleteDownloadedChapterVoice(message.payload || {});
     case "LIBRARY_DELETE_STORY":
       return queue.deleteDownloadedStory(message.payload?.storyId || null);
     case "LIBRARY_CONTINUE":

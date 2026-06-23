@@ -72,6 +72,12 @@ test("view model shows a running timer and pause control during playback", () =>
   assert.equal(view.pauseable, true);
 });
 
+test("view model exposes the current playback voice", () => {
+  const view = buildPopupViewModel(buildState({ voice: "bm_lewis" }), 1000);
+  assert.equal(view.currentVoiceId, "bm_lewis");
+  assert.equal(view.currentVoiceLabel, "Lewis");
+});
+
 test("bar ratios reflect played and warmed chunks against the total", () => {
   const state = buildState({ currentChunkIndex: 4, totalChunks: 10, readyAudioCount: 7 });
   assert.equal(getChapterRatio(state), 0.5);

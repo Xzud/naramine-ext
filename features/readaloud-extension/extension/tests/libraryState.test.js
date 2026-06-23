@@ -186,3 +186,51 @@ test("buildLibraryViewModel reports an empty library", () => {
   assert.equal(buildLibraryViewModel({ stories: [] }).empty, true);
   assert.equal(buildLibraryViewModel(null).empty, true);
 });
+
+test("voice variants are preserved in the library view model", () => {
+  const stories = groupLibraryByStory(
+    [
+      buildChapter({
+        sizeBytes: 3 * 1024 * 1024,
+        variants: [
+          {
+            variantChapterId: "chapter-1::voice:af_heart",
+            voiceId: "af_heart",
+            chunkCount: 10,
+            readyAudioCount: 10,
+            failedCount: 0,
+            sizeBytes: 2 * 1024 * 1024
+          },
+          {
+            variantChapterId: "chapter-1::voice:bm_lewis",
+            voiceId: "bm_lewis",
+            chunkCount: 10,
+            readyAudioCount: 4,
+            failedCount: 0,
+            sizeBytes: 1 * 1024 * 1024
+          }
+        ]
+      })
+    ],
+    {
+      warmingChapterIds: ["chapter-1"],
+      activeVoiceByChapter: {
+        "chapter-1": "bm_lewis"
+      }
+    }
+  );
+
+  const chapter = buildLibraryViewModel({ stories }).stories[0].chapters[0];
+  assert.equal(chapter.status, "processing");
+  assert.equal(chapter.meta, "40% downloaded · 2 voices · 3.0 MB");
+  assert.deepEqual(
+    chapter.voices.map((voice) => ({
+      label: voice.label,
+      isActive: voice.isActive
+    })),
+    [
+      { label: "Heart", isActive: false },
+      { label: "Lewis", isActive: true }
+    ]
+  );
+});

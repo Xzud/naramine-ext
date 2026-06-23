@@ -493,9 +493,47 @@
         color: var(--muted);
       }
 
-      .chapter-delete {
-        flex: none;
-        min-width: 88px;
+      .voice-chip-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .voice-chip {
+        border: 1px solid var(--hairline-soft);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.04);
+        color: var(--cream);
+        font-family: var(--font-ui);
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 1;
+        padding: 8px 12px;
+        cursor: pointer;
+        transition: border-color 150ms ease, background 150ms ease, color 150ms ease;
+      }
+
+      .voice-chip:hover {
+        border-color: rgba(236, 122, 114, 0.42);
+        color: var(--danger);
+        background: rgba(236, 122, 114, 0.08);
+      }
+
+      .voice-chip.active {
+        border-color: rgba(240, 180, 94, 0.45);
+        color: var(--amber-bright);
+        background: rgba(240, 180, 94, 0.1);
+      }
+
+      .voice-chip.partial {
+        opacity: 0.82;
+      }
+
+      .voice-chip.confirming {
+        border-color: var(--danger);
+        background: var(--danger);
+        color: #2a1010;
       }
 
       .empty-card {

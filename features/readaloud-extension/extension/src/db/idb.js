@@ -220,25 +220,53 @@ export async function getAudioChunkByIndex(chapterId, chunkIndex) {
 export async function getLibraryOverview() {
   return withTransaction(["chapters", "chunks", "audioChunks"], "readonly", async ({ chapters, chunks, audioChunks }) => {
     const chapterRecords = await promisifyRequest(chapters.getAll());
-    return Promise.all(
+    const overview = new Map();
+
+    await Promise.all(
       chapterRecords.map(async (chapter) => {
         const [chunkRecords, audioRecords] = await Promise.all([
           promisifyRequest(chunks.index("chapterId").getAll(chapter.chapterId)),
           promisifyRequest(audioChunks.index("chapterId").getAll(chapter.chapterId))
         ]);
-        return {
-          chapterId: chapter.chapterId,
-          storyId: chapter.storyId || null,
-          title: chapter.title || "",
-          sourceUrl: chapter.sourceUrl || "",
+        const chapterId = chapter.sourceChapterId || chapter.chapterId;
+        const voiceId =
+          chapter.voice || chunkRecords.find((record) => typeof record.voice === "string")?.voice || null;
+        const variant = {
+          variantChapterId: chapter.chapterId,
+          voiceId,
           createdAt: chapter.createdAt || 0,
           chunkCount: chunkRecords.length,
           readyAudioCount: audioRecords.length,
           failedCount: chunkRecords.filter((chunk) => chunk.status === "failed").length,
           sizeBytes: audioRecords.reduce((total, record) => total + (record.sizeBytes || record.blob?.size || 0), 0)
         };
+
+        if (!overview.has(chapterId)) {
+          overview.set(chapterId, {
+            chapterId,
+            storyId: chapter.storyId || null,
+            title: chapter.title || "",
+            sourceUrl: chapter.sourceUrl || "",
+            createdAt: chapter.createdAt || 0,
+            sizeBytes: 0,
+            variants: []
+          });
+        }
+
+        const entry = overview.get(chapterId);
+        entry.storyId = entry.storyId || chapter.storyId || null;
+        entry.title = entry.title || chapter.title || "";
+        entry.sourceUrl = entry.sourceUrl || chapter.sourceUrl || "";
+        entry.createdAt = Math.max(entry.createdAt || 0, chapter.createdAt || 0);
+        entry.sizeBytes += variant.sizeBytes;
+        entry.variants.push(variant);
       })
     );
+
+    return [...overview.values()].map((entry) => ({
+      ...entry,
+      variants: entry.variants.sort((left, right) => (left.voiceId || "").localeCompare(right.voiceId || ""))
+    }));
   });
 }
 
