@@ -67,7 +67,7 @@ The most important architectural rule is this:
 - `features/readaloud-extension/extension/src/background/service_worker.js`
   Thin message router. It creates one `PlaybackQueue` instance and forwards scoped messages like `PLAY`, `PAUSE`, `PAGE_READY`, `SYNC_SET`, `LIBRARY_GET`, and `SLEEP_SET` into queue methods.
 
-- `features/readaloud-extension/extension/src/popup/popup.html`
+- `features/readaloud-exETnsion/extension/src/popup/popup.html`
   Popup DOM shell.
 
 - `features/readaloud-extension/extension/src/popup/popup.js`
